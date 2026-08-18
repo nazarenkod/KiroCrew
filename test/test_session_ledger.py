@@ -381,9 +381,15 @@ def test_gateway_fire_callbacks_use_the_composer():
     from kiro_crew.slack import gateway
 
     src = inspect.getsource(gateway)
-    assert (
-        src.count("compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)") == 3
-    )
+    # Anchored on the ARGUMENT SEQUENCE, not the single-line call: the sites now also
+    # pass `loop.agent` (the crew the loop was armed under, so its nudge bodies expand
+    # that crew's variables) and black wraps the call across lines. Both halves still
+    # have to hold — the composer, and every site reaching it — so this asserts the
+    # argument run rather than a formatting that a later parameter would break again.
+    assert src.count("loop.message, loop.stop_sentinel_path, loop.slot_key") == 3
+    assert src.count("compose_nudge_body(") == 3
+    # The snapshot-less renderer must not come back at a fire site.
+    assert "render_nudge_message(loop.message" not in src
 
 
 # ── HTTP routes ───────────────────────────────────────────────────────────

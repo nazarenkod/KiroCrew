@@ -1757,7 +1757,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       saveDraftsDebounced()
     }
     // draft key is composerSlotRef; slot-change effect handles that transition.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pasteBlocks, saveDraftsDebounced])
   // Session references staged by dragging a session from the list onto this
   // pane. Serialized as LINKS on send — never the referenced transcript.
@@ -1772,7 +1771,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       saveDraftsDebounced()
     }
     // draft key is composerSlotRef; slot-change effect handles that transition.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingSessions, saveDraftsDebounced])
   /** Stage a dropped session. Ignores duplicates and overflow (addSessionRef
    *  returns the same array, so this is a no-op re-render-free path). */

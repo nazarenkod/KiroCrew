@@ -6201,6 +6201,34 @@
       "defaultValue": "kirocrew"
     },
     {
+      "path": "agents.*.variables",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Variables",
+      "help": "Variables scoped to this crew — the narrowest persisted scope. Override the workspace and global maps per key. Plain text in variables.json; not for secrets.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agents.*.variables.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
       "path": "agents.*.watchdog_tool_stall_suspect_secs",
       "kind": "core",
       "type": "number",
@@ -6299,6 +6327,34 @@
       "defaultValue": "workspace"
     },
     {
+      "path": "workspaces.*.variables",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Variables",
+      "help": "Variables scoped to this workspace. Override the global map per key and are themselves overridden by a crew's own variables.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "workspaces.*.variables.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
       "path": "default_workspace",
       "kind": "core",
       "type": "string",
@@ -6311,6 +6367,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "default"
+    },
+    {
+      "path": "variables",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Variables",
+      "help": "Global variables expanded as a doubled-brace token in prompts, chat messages and cron messages. Broadest scope: a workspace or crew overrides them per key. Plain text in variables.json; not for secrets.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "variables.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "memory_stores",

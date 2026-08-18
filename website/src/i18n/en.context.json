@@ -231,6 +231,7 @@
     "apps.commandBar.kind.app": "Right-aligned kind label on a Command Bar row, in a column with \"Command\", \"Setting\" and \"View\". Short for a Kiro Crew APP -- an installed extension such as Dev Fleet or Meetings -- so the row opens that app, not a generic program and not a mobile app. A noun naming what the row is. Keep it short: the label shares the row with the title and subtitle and is the first thing truncated.",
     "components.crewWebhookSection.last_used_ago": "Timestamp on a webhook token row in the crew editor, {{time}} is an already-localised relative time like '1h ago'. Lower-case: it follows the token's identity on the same line after a separator.",
     "components.crewWebhookSection.off": "Badge on a webhook credential row in the crew editor, shown when the credential's admission switch is disabled — the binding exists but cannot call in. 'Off' as in switched off, not 'remove'.",
-    "components.crewWebhookSection.retry": "Button in the crew editor webhook pane's load-failure box; re-runs the fetch that failed. A verb."
+    "components.crewWebhookSection.retry": "Button in the crew editor webhook pane's load-failure box; re-runs the fetch that failed. A verb.",
+    "pages.settings.variablesPanel.add": "Button on the Settings > Environment Variables panel that appends a new empty variable row to the table. Imperative verb, not the noun 'addition'; width-constrained, so keep it to one short word."
   }
 }
