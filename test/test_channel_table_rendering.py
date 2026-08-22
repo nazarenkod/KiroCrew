@@ -844,11 +844,23 @@ class TestDeliveryFraming:
     async def test_wecom_keeps_canonical_table_when_safe_cards_would_exceed_cap(
         self,
     ) -> None:
+        # Row count DERIVED from the declared cap, not hardcoded: WeCom's
+        # ``max_message_chars`` is a byte-safe budget (``WECOM_MAX_REPLY_BYTES // 4``),
+        # so a fixed row count that fitted one value silently stops testing "a table
+        # that fits" when the cap changes -- it starts asserting its own premise and
+        # fails there instead.
         token = "opaque-token-value"
-        body = [f"| Row 000 | Bearer {token} | {'x' * 30} |"]
-        body.extend(f"| Row {index:03d} | ok |  |" for index in range(1, 700))
-        table = "| Request | Authorization | Notes |\n" "| --- | --- | --- |\n" + "\n".join(body)
         cap = WECOM_CAPABILITIES.max_message_chars
+        header = "| Request | Authorization | Notes |\n| --- | --- | --- |\n"
+        first = f"| Row 000 | Bearer {token} | {'x' * 30} |"
+        filler = "| Row {index:03d} | ok |  |"
+        per_row = len(filler.format(index=1)) + 1
+        rows = (cap - len(header) - len(first)) // per_row
+        assert rows > 1, "the cap must leave room for a multi-row table"
+        body = [first]
+        body.extend(filler.format(index=index) for index in range(1, rows))
+        table = header + "\n".join(body)
+        last_row = f"Row {rows - 1:03d}"
         client = FakeWeComClient()
         renderer = WeComRenderer(client, "rq", "https://r.test", WECOM_CAPABILITIES)
         assert len(table) <= cap
@@ -858,7 +870,7 @@ class TestDeliveryFraming:
         await renderer.on_done()
 
         assert client.final() == table
-        assert "Row 699" in client.final()
+        assert last_row in client.final()
 
 
 class TestNativeTargetsAreUntouched:
