@@ -22,16 +22,18 @@ from .run_coordinator.models import (
     CommandOperation,
     CommandStatus,
     CoordinatorDecision,
+    ObservedState,
     OwnerLease,
     RunCoordinator,
+    RunOutcome,
     SubmitControl,
     SubmitRun,
 )
 from .security import redact_credentials, redact_exfiltration_urls
 
 _CONTROL_LEASE_SECS = 30.0
-_EXECUTION_LEASE_SECS = 90.0
 logger = logging.getLogger(__name__)
+EXECUTION_LEASE_SECONDS = 90.0
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,21 @@ class SubagentCommandAuthority:
         stored: AdmittedExecution | None = None
         if command.result_json:
             stored = cls._decode_execution_result(command.result_json, run_id, task)
+        run = receipt.run
+        if (
+            not command.result_json
+            and run is not None
+            and run.observed_state is ObservedState.TERMINAL
+            and run.outcome is not None
+            and run.outcome is not RunOutcome.COMPLETED
+        ):
+            return {
+                "found": True,
+                "id": run_id,
+                "error": run.error or f"run ended {run.outcome.value}",
+                "code": f"run_{run.outcome.value}",
+                "counted": True,
+            }
         if command.status is CommandStatus.REJECTED:
             error = (
                 stored.error
@@ -394,10 +411,15 @@ class SubagentCommandAuthority:
             )
             if claim is None:
                 raise AuthorityUnavailable("command outcome is still pending")
+            if claim.fence is None or claim.run is None:
+                raise AuthorityUnavailable("execution claim omitted its run fence")
             call_kwargs = {
                 **kwargs,
                 "_preassigned_id": receipt.run.run_id,
                 "_coordinator_admitted": True,
+                "_coordinator_command": claim.command,
+                "_coordinator_fence": claim.fence,
+                "_coordinator_version": claim.run.version,
             }
             try:
                 if operation is CommandOperation.CONTINUE:
@@ -598,14 +620,14 @@ class SubagentCommandAuthority:
             return
 
         async def renew() -> None:
-            cadence = _EXECUTION_LEASE_SECS / 3
+            cadence = EXECUTION_LEASE_SECONDS / 3
             while True:
                 await self._sleep(cadence)
                 try:
                     renewed = await self._coordinator.renew(
                         run_id,
                         fence,
-                        self._clock() + _EXECUTION_LEASE_SECS,
+                        self._clock() + EXECUTION_LEASE_SECONDS,
                     )
                 except Exception:
                     continue
@@ -656,11 +678,17 @@ class SubagentCommandAuthority:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    async def reject_waiting_execution(self, run_id: str, error: str) -> None:
-        """Finish a queued or approval-waiting command before dropping its lease."""
+    async def reject_waiting_execution(
+        self,
+        run_id: str,
+        error: str,
+        *,
+        stop_heartbeat: bool = True,
+    ) -> None:
+        """Reject waiting work, optionally retaining its lease through terminal commit."""
 
         waiting = self._waiting_executions.get(run_id)
-        finish_error = ""
+        finish_error = "waiting execution claim not found" if waiting is None else ""
         if waiting is not None:
             command_fence, _result_json = waiting
             result_json = self._encode_execution_result(
@@ -679,7 +707,8 @@ class SubagentCommandAuthority:
             else:
                 if finished.decision is CoordinatorDecision.REJECTED:
                     finish_error = self._reason(finished)
-        await self.stop_execution_heartbeat(run_id)
+        if stop_heartbeat:
+            await self.stop_execution_heartbeat(run_id)
         if finish_error:
             raise AuthorityOutcomeUncertain(
                 f"waiting execution rejection was not durably finished: {finish_error}"
@@ -709,7 +738,7 @@ class SubagentCommandAuthority:
         return OwnerLease(
             owner_id=self._owner_id,
             lease_expires_at=self._clock()
-            + (_EXECUTION_LEASE_SECS if execution else _CONTROL_LEASE_SECS),
+            + (EXECUTION_LEASE_SECONDS if execution else _CONTROL_LEASE_SECS),
         )
 
     @staticmethod

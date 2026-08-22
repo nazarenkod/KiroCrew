@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.run_coordinator import MemoryRunCoordinator
+from kiro_crew.run_coordinator import CommandStatus, MemoryRunCoordinator
 from kiro_crew.subagent import _TURN_LIMIT, SubagentManager
 from kiro_crew.subagent_command_authority import CommandIdentity
 
@@ -303,7 +303,10 @@ class TestSpawnWithApprovalCallback:
 
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             info = await manager.command_authority.spawn(identity, "rejected task")
-            await manager._tasks[info.id]
+            for _ in range(20):
+                if info.done and info.id not in manager._tasks:
+                    break
+                await asyncio.sleep(0)
 
         assert await manager.command_authority.lookup_response(identity.idempotency_key) == {
             "found": True,
@@ -312,6 +315,11 @@ class TestSpawnWithApprovalCallback:
             "code": "spawn_rejected",
             "counted": True,
         }
+        receipt = await coordinator.get_command_by_key(identity.idempotency_key)
+        assert receipt is not None
+        assert receipt.command.status is CommandStatus.REJECTED
+        assert receipt.command.rejection_reason == "spawn rejected"
+        assert receipt.command.result_json
 
     @pytest.mark.asyncio
     async def test_keyed_queued_cancel_finishes_durable_command(self) -> None:
@@ -342,21 +350,27 @@ class TestSpawnWithApprovalCallback:
 
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             first = await manager.command_authority.spawn(first_identity, "hold the slot")
+            first_task = manager._tasks[first.id]
             queued = await manager.command_authority.spawn(queued_identity, "cancel me")
             assert queued.queued is True
             assert await manager.cancel(queued.id) is True
             approval_gate.set()
-            await manager._tasks[first.id]
+            await first_task
 
         assert await manager.command_authority.lookup_response(
             queued_identity.idempotency_key
         ) == {
             "found": True,
             "id": queued_identity.run_id,
-            "error": "spawn cancelled before start",
+            "error": "run stopped before execution",
             "code": "spawn_rejected",
             "counted": True,
         }
+        receipt = await coordinator.get_command_by_key(queued_identity.idempotency_key)
+        assert receipt is not None
+        assert receipt.command.status is CommandStatus.REJECTED
+        assert receipt.command.rejection_reason == "run stopped before execution"
+        assert receipt.command.result_json
 
     @pytest.mark.asyncio
     async def test_rejected_spawn_decrements_running_count(self) -> None:

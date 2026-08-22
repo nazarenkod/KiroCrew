@@ -457,7 +457,7 @@ async def test_exact_execution_command_claim_and_finish_are_idempotent(
 
 
 @pytest.mark.asyncio
-async def test_execution_rejection_atomically_terminals_created_run(
+async def test_execution_rejection_retains_fence_for_terminal_outbox_commit(
     coordinator: RunCoordinator,
     clock: FakeClock,
 ) -> None:
@@ -477,9 +477,9 @@ async def test_execution_rejection_atomically_terminals_created_run(
     assert rejected.value is not None
     assert rejected.value.status is CommandStatus.REJECTED
     assert run is not None
-    assert run.observed_state is ObservedState.TERMINAL
-    assert run.outcome is RunOutcome.FAILED
-    assert run.error == "approval denied"
+    assert run.observed_state is ObservedState.ACCEPTED
+    assert run.outcome is None
+    assert run.error == ""
     assert await coordinator.claim_commands(OwnerLease("executor", clock.value + 10), limit=1) == []
 
 
@@ -509,6 +509,9 @@ async def test_command_claim_returns_fence_and_advances_legal_transitions(
     assert starting.decision is CoordinatorDecision.APPLIED
     assert starting.value is not None
     assert starting.value.observed_state is ObservedState.STARTING
+    receipt = await coordinator.get_command_by_key("key-1")
+    assert receipt is not None
+    assert receipt.command.status is CommandStatus.CLAIMED
 
     running = await coordinator.mark_running(
         "run-1", claim.fence, expected_version=starting.value.version
@@ -827,3 +830,49 @@ async def test_renew_requires_current_unexpired_fence(
     assert await coordinator.renew("run-1", claim.fence, until=clock.value + 20) is True
     clock.value += 21
     assert await coordinator.renew("run-1", claim.fence, until=clock.value + 20) is False
+
+
+@pytest.mark.asyncio
+async def test_expired_execution_fence_can_complete_before_takeover(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit(_request())
+    claim = (
+        await coordinator.claim_commands(
+            OwnerLease(owner_id="gateway-1", lease_expires_at=clock.value + 5), limit=1
+        )
+    )[0]
+    assert claim.fence is not None
+    assert claim.run is not None
+    starting = await coordinator.mark_starting(
+        claim.command,
+        claim.fence,
+        claim.run.version,
+    )
+    assert starting.value is not None
+    running = await coordinator.mark_running(
+        claim.run.run_id,
+        claim.fence,
+        starting.value.version,
+    )
+    assert running.value is not None
+    clock.value += 6
+
+    completed = await coordinator.complete(
+        RunCompletion(
+            run_id=claim.run.run_id,
+            outcome=RunOutcome.COMPLETED,
+            result_path="/result.txt",
+            error="",
+            event_type="subagent_completion",
+            destination="dashboard:parent",
+            payload_json="{}",
+            terminal_at=clock.value,
+        ),
+        claim.fence,
+        running.value.version,
+    )
+
+    assert completed.decision is CoordinatorDecision.APPLIED
+    assert completed.value is not None
