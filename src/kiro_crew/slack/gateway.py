@@ -2826,7 +2826,12 @@ class GatewayOrchestrator:
                             task = spawn_guarded_turn(
                                 self.dashboard_state,
                                 slot,
-                                _run_chat(self.dashboard_state, slot, wrapped),
+                                _run_chat(
+                                    self.dashboard_state,
+                                    slot,
+                                    wrapped,
+                                    _directive_user_origin=False,
+                                ),
                             )
                             slot.task = task
                         self.dashboard_state.push_slots_update()
@@ -5135,7 +5140,13 @@ class GatewayOrchestrator:
             self.dashboard_state,
             slot,
             self.dashboard_state.run_background_turn(
-                slot, _run_chat(self.dashboard_state, slot, tagged)
+                slot,
+                _run_chat(
+                    self.dashboard_state,
+                    slot,
+                    tagged,
+                    _directive_user_origin=False,
+                ),
             ),
         )
         # Mirror dashboard /api/chat/send path so slot.running == True and sidebar
@@ -5704,7 +5715,14 @@ class GatewayOrchestrator:
                     _retrigger_recovery(slot, parent_key)
 
             _task = asyncio.create_task(
-                bounded_chat_turn(_run_chat(self.dashboard_state, slot, msg)),
+                bounded_chat_turn(
+                    _run_chat(
+                        self.dashboard_state,
+                        slot,
+                        msg,
+                        _directive_user_origin=False,
+                    )
+                ),
             )
             slot.task = _task
             self._background_tasks.add(_task)
@@ -6430,7 +6448,12 @@ class GatewayOrchestrator:
                         # Slot is idle — start _run_chat.
                         _task = asyncio.create_task(
                             bounded_chat_turn(
-                                _run_chat(self.dashboard_state, _injection_slot, announce)
+                                _run_chat(
+                                    self.dashboard_state,
+                                    _injection_slot,
+                                    announce,
+                                    _directive_user_origin=False,
+                                )
                             )
                         )
                         _injection_slot.task = _task

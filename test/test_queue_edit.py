@@ -38,6 +38,14 @@ class TestQueueEditHelper:
         assert slot._queue[0]["id"] == qid
         assert slot._queue[0]["content"] == "new"
 
+    def test_edit_by_id_replaces_directive_provenance(self):
+        slot = _ChatSlot("s1")
+        qid = slot.queue_append("human text", directive_user_origin=True)
+
+        slot.queue_edit_by_id(qid, "app replacement")
+
+        assert "_directive_user_origin" not in slot._queue[0]
+
     def test_edit_by_id_not_found(self):
         slot = _ChatSlot("s1")
         slot.queue_append("msg")
@@ -112,7 +120,7 @@ class TestQueueEditEndpoint:
     async def test_edit_updates_queue_and_messages(self):
         state = _make_state()
         slot = state.get_or_create_slot("chat-1")
-        qid = slot.queue_append("old text")
+        qid = slot.queue_append("old text", directive_user_origin=True)
         slot.append("queued", "old text", json.dumps({"queue_id": qid}))
 
         with patch("kiro_crew.sel.sel") as mock_sel:
@@ -129,9 +137,35 @@ class TestQueueEditEndpoint:
                 assert "new text" in data["content"]
 
         assert slot._queue[0]["content"] == "new text"
+        assert slot._queue[0]["_directive_user_origin"] is True
         queued = [m for m in slot.messages if m.get("role") == "queued"]
         assert len(queued) == 1
         assert queued[0]["content"] == "new text"
+
+    @pytest.mark.asyncio
+    async def test_app_edit_downgrades_human_directive_provenance(self):
+        state = _make_state()
+        slot = state.get_or_create_slot("chat-1", app="app-A")
+        qid = slot.queue_append("human text", directive_user_origin=True)
+
+        @web.middleware
+        async def inject_app(request, handler):
+            request["app"] = "app-A"
+            return await handler(request)
+
+        with patch("kiro_crew.sel.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            app = _make_app(state)
+            app.middlewares.insert(0, inject_app)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.patch(
+                    f"/api/chat/slots/chat-1/queue/{qid}",
+                    json={"content": "app replacement"},
+                )
+                assert resp.status == 200
+
+        assert slot._queue[0]["content"] == "app replacement"
+        assert "_directive_user_origin" not in slot._queue[0]
 
     @pytest.mark.asyncio
     async def test_edit_slot_not_found(self):
@@ -230,4 +264,9 @@ class TestQueueEditEndpoint:
                 assert resp.status == 200
 
         assert slot._queue[0] == {"id": id1, "content": "same", "kind": ""}
-        assert slot._queue[1] == {"id": id2, "content": "edited", "kind": ""}
+        assert slot._queue[1] == {
+            "id": id2,
+            "content": "edited",
+            "kind": "",
+            "_directive_user_origin": True,
+        }

@@ -62,6 +62,11 @@ def _pin_state_dir(tmp_path: Path):
         mock.patch.object(r, "_INDEX_PATH", state / "index.json"),
         mock.patch.object(r, "_DELETED_PATH", state / "deleted.json"),
         mock.patch.object(r, "_SETTINGS_PATH", state / "settings.json"),
+        mock.patch.object(r, "_EXECUTION_CLAIMS", {}),
+        mock.patch.object(r, "_EXECUTION_STOPS", {}),
+        mock.patch.object(r, "_PENDING_DISPATCH_CLAIMS", {}),
+        mock.patch.object(r, "_OBSERVED_SLOT_KEYS", {}),
+        mock.patch.object(r, "_OBSERVED_SPEC_DIRS", {}),
     ):
         r._SLOT_KEYS.clear()
         yield state
@@ -282,6 +287,9 @@ class TestNormalizeSpecState:
                 "options": ["A", "B"],
                 "recommended": "A",
                 "answer": "",
+                # This backend's field, never the agent's: normalization always
+                # reports False and only the recorded-answer overlay sets it.
+                "locked": False,
             }
         ]
         assert out["blocking"] == "waiting on review"
@@ -717,14 +725,14 @@ class TestDerivePhase:
 
 class TestCollectSpecDocuments:
     def test_absent_documents_read_as_none_and_the_state_file_as_none(self, tmp_path):
-        phase, files, state = r._collect_spec_documents(tmp_path)
+        phase, files, state = r._collect_spec_documents("demo", tmp_path)
         assert phase == "new"
         assert files == {"tasks.md": None, "design.md": None, "requirements.md": None}
         assert state is None
 
     def test_documents_are_redacted_on_their_way_out(self, tmp_path):
         (tmp_path / "requirements.md").write_text(f"token is {CRED_NAME}")
-        phase, files, _state = r._collect_spec_documents(tmp_path)
+        phase, files, _state = r._collect_spec_documents("demo", tmp_path)
         assert phase == "requirements"
         assert files["requirements.md"] is not None
         assert CRED_NAME not in files["requirements.md"]
@@ -733,12 +741,12 @@ class TestCollectSpecDocuments:
         (tmp_path / ".spec-state.json").write_text(
             json.dumps({"blocking": "review", "surprise": 1})
         )
-        _phase, _files, state = r._collect_spec_documents(tmp_path)
+        _phase, _files, state = r._collect_spec_documents("demo", tmp_path)
         assert state == {"decisions": [], "blocking": "review", "context": {"template": ""}}
 
     def test_a_malformed_state_file_is_none_rather_than_an_error(self, tmp_path):
         (tmp_path / ".spec-state.json").write_text("{ not json")
-        _phase, _files, state = r._collect_spec_documents(tmp_path)
+        _phase, _files, state = r._collect_spec_documents("demo", tmp_path)
         assert state is None
 
 
@@ -1823,7 +1831,8 @@ class _Slot:
         self._pending_synthesis = False
         self.queued: list[str] = []
 
-    def queue_append(self, message: str) -> None:
+    def queue_append(self, message: str, *, directive_user_origin: bool) -> None:
+        assert directive_user_origin is False
         self._queue.append(message)
 
     def append(self, role: str, content: str) -> None:
@@ -3388,7 +3397,7 @@ class TestHandleGet:
         spec.mkdir()
         _write_index({"demo": _entry(spec)})
 
-        def _collect_then_delete(_spec_dir):
+        def _collect_then_delete(_name, _spec_dir):
             r._save_index({})
             return "new", {}, None
 
@@ -3404,7 +3413,7 @@ class TestHandleGet:
         spec.mkdir()
         _write_index({"demo": _entry(spec)})
 
-        def _collect_then_replace(_spec_dir):
+        def _collect_then_replace(_name, _spec_dir):
             r._save_index({"demo": _entry(tmp_path / "somewhere-else")})
             return "new", {}, None
 
@@ -3802,7 +3811,11 @@ class TestHandleHandoff:
 
         _armed.authz.side_effect = _authz_then_delete
         remove = mock.AsyncMock()
-        with _ready_handoff(), _no_rehydrate(), mock.patch.object(r, "_remove_nudge_loop", remove):
+        with (
+            _ready_handoff(),
+            _no_rehydrate(),
+            mock.patch.object(r, "_remove_nudge_loop_for_slot", remove),
+        ):
             out = await r._handle_handoff(_handoff_request(tmp_path, _State()))
         assert out.status == 409 and _body(out)["code"] == "spec_changed_during_start"
         # Ours arrives after the delete's own by-name teardown, so it must be

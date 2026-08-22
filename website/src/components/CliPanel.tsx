@@ -61,7 +61,7 @@ function scheduleTermThemeRefresh() {
   _themeRaf = requestAnimationFrame(() => { _themeRaf = 0; refreshTermThemes() })
 }
 function ensureThemeObserver() {
-  if (_themeObserver || typeof document === 'undefined') return
+  if (typeof document === 'undefined') return
   // A terminal's xterm colours are a construction-time snapshot (canvas, not
   // CSS), so they must be re-read on TWO distinct theme signals:
   //  (1) built-in themes / mode swaps flip <html data-theme> — an attribute change;
@@ -70,19 +70,33 @@ function ensureThemeObserver() {
   //      loads). data-theme's VALUE doesn't change then, so an attribute-only
   //      observer misses it and the terminal stays on the boot-default palette.
   // The attribute filter catches (1); watching <head> childList catches (2).
-  _themeObserver = new MutationObserver((records) => {
-    for (const r of records) {
-      if (r.type === 'attributes') { scheduleTermThemeRefresh(); return }
-      for (const n of r.addedNodes) {
-        if (n instanceof HTMLStyleElement && n.id.startsWith('mc-custom-theme-')) {
-          scheduleTermThemeRefresh()
-          return
+  if (!_themeObserver) {
+    _themeObserver = new MutationObserver((records) => {
+      for (const r of records) {
+        if (r.type === 'attributes') { scheduleTermThemeRefresh(); return }
+        for (const n of r.addedNodes) {
+          // Node-name matching works across DOM realms. A style injected by an
+          // embedded document can fail the host realm's instanceof check even
+          // though its CSS variables apply to this document.
+          if (n.nodeType === Node.ELEMENT_NODE
+            && (n as Element).tagName === 'STYLE'
+            && (n as Element).id.startsWith('mc-custom-theme-')) {
+            scheduleTermThemeRefresh()
+            return
+          }
         }
       }
-    }
-  })
+    })
+  }
+  // A restored/bfcached document can replace <head> without reloading this
+  // module. Reconnect the singleton to the current roots on mount; this also
+  // drops registrations on detached roots instead of retaining them forever.
+  _themeObserver.disconnect()
   _themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
   _themeObserver.observe(document.head, { childList: true })
+  // Re-read once after reconnecting so a mutation delivered between document
+  // restoration and this mount cannot leave an already-cached terminal stale.
+  refreshTermThemes()
 }
 
 /* ── Terminal font sync ──
