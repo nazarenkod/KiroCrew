@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew.run_coordinator import MemoryRunCoordinator
 from kiro_crew.subagent import _TURN_LIMIT, SubagentManager
+from kiro_crew.subagent_command_authority import CommandIdentity
 
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py`` — no per-file fixture needed.
@@ -283,6 +285,78 @@ class TestSpawnWithApprovalCallback:
         assert info.error == "spawn rejected"
         assert info.result == ""
         on_done_callback.assert_awaited_once_with(info)
+
+    @pytest.mark.asyncio
+    async def test_keyed_approval_rejection_finishes_durable_command(self) -> None:
+        coordinator = MemoryRunCoordinator()
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            on_spawn_approval=AsyncMock(return_value=False),
+            coordinator=coordinator,
+        )
+        identity = CommandIdentity(
+            run_id="approval-rejected",
+            command_id="command-approval-rejected",
+            idempotency_key="key-approval-rejected",
+        )
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            info = await manager.command_authority.spawn(identity, "rejected task")
+            await manager._tasks[info.id]
+
+        assert await manager.command_authority.lookup_response(identity.idempotency_key) == {
+            "found": True,
+            "id": identity.run_id,
+            "error": "spawn rejected",
+            "code": "spawn_rejected",
+            "counted": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_keyed_queued_cancel_finishes_durable_command(self) -> None:
+        approval_gate = asyncio.Event()
+
+        async def deny_after_gate(*_args: object) -> bool:
+            await approval_gate.wait()
+            return False
+
+        coordinator = MemoryRunCoordinator()
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+            on_spawn_approval=deny_after_gate,
+            coordinator=coordinator,
+        )
+        first_identity = CommandIdentity(
+            run_id="approval-blocker",
+            command_id="command-approval-blocker",
+            idempotency_key="key-approval-blocker",
+        )
+        queued_identity = CommandIdentity(
+            run_id="queued-cancelled",
+            command_id="command-queued-cancelled",
+            idempotency_key="key-queued-cancelled",
+        )
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            first = await manager.command_authority.spawn(first_identity, "hold the slot")
+            queued = await manager.command_authority.spawn(queued_identity, "cancel me")
+            assert queued.queued is True
+            assert await manager.cancel(queued.id) is True
+            approval_gate.set()
+            await manager._tasks[first.id]
+
+        assert await manager.command_authority.lookup_response(
+            queued_identity.idempotency_key
+        ) == {
+            "found": True,
+            "id": queued_identity.run_id,
+            "error": "spawn cancelled before start",
+            "code": "spawn_rejected",
+            "counted": True,
+        }
 
     @pytest.mark.asyncio
     async def test_rejected_spawn_decrements_running_count(self) -> None:
