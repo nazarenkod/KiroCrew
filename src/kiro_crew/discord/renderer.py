@@ -649,7 +649,10 @@ class DiscordRenderer(Renderer):
         self._tool = self._last_tool
         await self._stream_live(force=True)
 
-    async def on_prompt_choice(self, options: list[dict[str, Any]], request_id: str | int) -> None:
+    async def on_prompt_choice(
+        self, options: list[dict[str, Any]], request_id: str | int, tool_input: str = ""
+    ) -> None:
+        # tool_input is accepted and ignored: the button rows carry no body.
         # Approve/Deny as a SEPARATE message so ongoing streaming edits to the
         # answer bubble don't clobber the buttons. custom_id carries a
         # per-prompt nonce (a:<request_id>:<nonce>:<1|0>, well under Discord's

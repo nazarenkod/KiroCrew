@@ -26,17 +26,15 @@ import json
 import logging
 import os
 import random
-import re
 import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import aiohttp
 
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.outbound_files import OutboundFile
+from kiro_crew.messaging.outbound_files import OutboundFile, upload_filename
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -52,17 +50,6 @@ DISCORD_MAX_FILES_PER_MESSAGE = 10
 DISCORD_MAX_TOTAL_UPLOAD_BYTES = 25 * 1024 * 1024
 
 # Sniffed MIME determines the canonical inline-rendering extension.
-_MIME_EXT = {
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "image/gif": "gif",
-    "image/webp": "webp",
-    "image/bmp": "bmp",
-}
-
-# Multipart filenames are restricted before entering Content-Disposition.
-_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
 _API_BASE = "https://discord.com/api/v10"
 _GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
 
@@ -817,18 +804,6 @@ def _safe_description(alt: str) -> str:
     """Redact the unescaped description before truncation can split a secret."""
     out, _ = redact_for_display(alt, lambda s: redact_credentials(redact_exfiltration_urls(s)[0])[0])
     return out[:1024]
-
-
-def upload_filename(file: OutboundFile, index: int) -> str:
-    """Derive and re-scan a header-safe filename from an untrusted path."""
-    ext = _MIME_EXT.get(file.mime, "bin")
-    stem = _UNSAFE_FILENAME_RE.sub("_", Path(file.path).name).lstrip(".")
-    stem = stem[: -len(Path(stem).suffix)] if Path(stem).suffix else stem
-    stem = stem.strip("._")[:64]
-    name = f"{stem or f'image_{index}'}.{ext}"
-    redacted, _ = redact_exfiltration_urls(name)
-    redacted, _ = redact_credentials(redacted)
-    return name if redacted == name else f"image_{index}.{ext}"
 
 
 def _build_upload_form(payload: dict[str, Any], files: Sequence[OutboundFile]) -> aiohttp.FormData:

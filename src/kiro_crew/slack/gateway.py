@@ -2526,6 +2526,27 @@ class GatewayOrchestrator:
             max_attempts=max_attempts,
         )
 
+    def _record_cron_delivery(self, job: CronJob, result_hash: str) -> None:
+        """Advance the dedup anchor after a CONFIRMED delivery, on any surface.
+
+        Delivery-agnostic on purpose, and that is the whole point: this triple is
+        the state the duplicate-suppression read consults, so a surface that
+        delivers a result without advancing it can never suppress the next
+        identical one. Leaving it to the Slack branch alone left every
+        channel-delivered cron with ``last_posted_hash == ""`` forever, so an
+        unchanged-output job spammed the chat on every tick where Slack posted
+        once and then went quiet for ``_SUCCESS_REMINDER_SECS``, and the "same
+        result N times in a row" reminder could never fire there at all.
+
+        Call it only where delivery is CONFIRMED. In particular the
+        dashboard-notification-only path must NOT: the bell is passive and the
+        operator may never open it, so counting it as delivered would suppress a
+        result nobody has seen.
+        """
+        job.last_posted_hash = result_hash
+        job.consecutive_dupes = 0
+        job.last_posted_at = time.time()
+
     def _remember_options(
         self,
         session_key: str,
@@ -2949,11 +2970,31 @@ class GatewayOrchestrator:
                         "Dashboard notify failed in cron run-failure alert path", exc_info=True
                     )
                 slack_failed = False  # real delivery exceptions only
-                if self.slack:
-                    # Name the machine for the same reason the message path does:
-                    # a laptop and a cloud desktop can both run Kiro Crew, and the
-                    # DM is the only place the user learns which one failed.
-                    host = socket.gethostname().split(".")[0]
+                # Name the machine for the same reason the message path does:
+                # a laptop and a cloud desktop can both run Kiro Crew, and the
+                # DM is the only place the user learns which one failed.
+                host = socket.gethostname().split(".")[0]
+                # A cron created from a non-Slack channel reports its FAILURES to
+                # that conversation, on the same governed channel-first ladder the
+                # success leg uses. Without this rung a job that succeeds reports
+                # into the channel while the same job crashing every minute
+                # reports only to the dashboard bell -- which reads as idle rather
+                # than broken, the exact state this alert exists to prevent, and
+                # worse than a uniform gap because the success path trained the
+                # expectation. ``job.session_key`` is the CREATING conversation
+                # and ``_deliver_channel_reply`` returns False for a Slack,
+                # dashboard or unrecognized key, so the Slack branch below is
+                # reached exactly as before for those. The unescaped ``label`` /
+                # ``text`` are the ones that travel: both are already redacted,
+                # and mrkdwn escaping is a Slack-sink concern that would reach
+                # another channel's reader as a literal ``&lt;``.
+                channel_delivered = False
+                if job.session_key:
+                    channel_delivered = await self._deliver_channel_reply(
+                        job.session_key,
+                        f"⏰ Cron: {label} {mark} {headline} on {host}\n{text}",
+                    )
+                if self.slack and not channel_delivered:
                     # Slack PARSES entity markup in a message's text, and both
                     # halves of this one are attacker-shaped: the job name is
                     # user-authored and the reason carries subprocess output. A job
@@ -2994,7 +3035,10 @@ class GatewayOrchestrator:
                 # Advance dedup only once the reason actually reached someone.
                 # "No channel available" counts as delivered (the bell rang), the
                 # same skip-vs-failure split the message path draws — otherwise a
-                # Slack-less install re-notifies the dashboard on every fire.
+                # Slack-less install re-notifies the dashboard on every fire. A
+                # channel-delivered alert leaves ``slack_failed`` False and so
+                # advances here too: the anchor is delivery-agnostic, and a
+                # surface that delivers without advancing it can never suppress.
                 if not slack_failed:
                     job.last_failure_hash = fh
                     job.last_failure_at = time.time()
@@ -3003,7 +3047,14 @@ class GatewayOrchestrator:
                         session_key=f"cron:{job.id}",
                         tool_name="cron_run_failure_alert",
                         outcome="denied" if denied else "alerted",
-                        downstream_service="slack" if self.slack else "none",
+                        # The surface the reason actually reached, so the audit
+                        # trail distinguishes a channel-delivered alert from a
+                        # Slack one rather than naming Slack for both.
+                        downstream_service=(
+                            channel_namespace_of(job.session_key)
+                            if channel_delivered
+                            else ("slack" if self.slack else "none")
+                        ),
                     )
                 except Exception:
                     logger.debug(
@@ -4082,7 +4133,16 @@ class GatewayOrchestrator:
                     logger.debug("usage row (cron) persist failed", exc_info=True)
 
                 # ── Error deduplication ──
-                # Suppress Slack for repeated identical results to avoid spam.
+                # Suppress repeated identical results to avoid spam. This is
+                # delivery-agnostic in both directions: the anchor it reads is
+                # advanced by _record_cron_delivery on EVERY confirmed surface,
+                # so the early return below now suppresses the channel post too,
+                # not only Slack's. That is a real behaviour change for a
+                # channel-delivered cron -- it used to post unconditionally on
+                # every tick -- and it is the intended one: identical output is
+                # equally noisy in a Telegram chat, and the 24h reminder plus the
+                # "same result N times in a row" caption are what keep a
+                # persistently-identical job from going unnoticed.
                 rh = _result_hash(result_text)
 
                 _gate_counted = _apply_gate_verdict(job, _gate)
@@ -4100,7 +4160,7 @@ class GatewayOrchestrator:
                         )
                     else:
                         logger.info(
-                            "Cron '%s': duplicate result #%d — suppressing Slack",
+                            "Cron '%s': duplicate result #%d — suppressing delivery",
                             job.name,
                             job.consecutive_dupes,
                         )
@@ -4209,7 +4269,38 @@ class GatewayOrchestrator:
                         redacted_for_dash,
                         meta=notify_meta,
                     )
-                if self.slack:
+                # A cron created from a non-Slack channel reports back to THAT
+                # conversation. Without this the result reached only the dashboard
+                # bell and Slack, so a Telegram-only operator's scheduled jobs ran
+                # and reported nowhere they would ever see. ``job.session_key`` is
+                # the CREATING conversation (the run's own key is ``cron:{id}``,
+                # which belongs to no channel), and ``_deliver_channel_reply``
+                # returns False for a Slack, dashboard or unrecognized key — so the
+                # Slack branch below is reached exactly as before for those.
+                _channel_delivered = False
+                if job.session_key:
+                    _channel_delivered = await self._deliver_channel_reply(
+                        job.session_key, f"⏰ Cron: {job.name}\n\n{result_text}"
+                    )
+                    if _channel_delivered:
+                        self._record_cron_delivery(job, rh)
+                        # No reply-anchor write to mirror the Slack branch's
+                        # set_thread/set_channel below, deliberately. Those two
+                        # record where a Slack cron post LANDED so a later
+                        # subagent completion under ``cron:{id}`` can be threaded
+                        # onto it; the channel leg learns nothing equivalent at
+                        # send time -- its conversation was already resolved FROM
+                        # the creating session's own durable origin/mirror link,
+                        # which every later delivery re-reads. Writing the channel
+                        # id into ``cron:{id}``'s slot would also be inert:
+                        # ``_channel_reply_link`` refuses a ``cron:`` key outright
+                        # (no channel namespace), and its stored-value rung
+                        # expects a direct peer's USER id, not a conversation.
+                        # Routing a cron's subagent completions back to the
+                        # creating channel needs a ``cron:{id}`` -> creating-key
+                        # edge instead, which is its own change; half of it here
+                        # would look like parity without being it.
+                if self.slack and not _channel_delivered:
                     try:
                         # Retry only open_dm (transient Slack API errors).
                         # Delivery (post_blocks/post_message) is NOT retried to avoid duplicates.
@@ -4250,9 +4341,7 @@ class GatewayOrchestrator:
                             for part in parts[1:]:
                                 await self.slack.post_message(channel, part, thread_root)
                             # Dedup state: only advance after confirmed delivery.
-                            job.last_posted_hash = rh
-                            job.consecutive_dupes = 0
-                            job.last_posted_at = time.time()
+                            self._record_cron_delivery(job, rh)
                         else:
                             logger.warning(
                                 "Cron '%s': no channel resolved, skipping notification", job.name
@@ -4485,12 +4574,44 @@ class GatewayOrchestrator:
                 # mirroring the dashboard alert_title redaction above.
                 fail_msg, _ = redact_exfiltration_urls(fail_msg)
                 fail_msg, _ = redact_credentials(fail_msg)
+                # Channel-neutral twin of ``fail_msg``: the same sentence with no
+                # mrkdwn. Composed separately rather than reusing the escaped
+                # form because Slack's markup is not another channel's dialect --
+                # a fence and a ``&lt;`` would reach that reader literally -- and
+                # separately from ``render_for_slack`` is how the success leg
+                # composes its own channel string too.
+                if is_dup:
+                    channel_fail_msg = (
+                        f"⏰ Cron: {job.name} ❌ Job still failing on {host}"
+                        f" ({job.consecutive_failures + 1} consecutive failures)"
+                        f" — check logs.\n{exc_summary[:_CRON_FAILURE_DETAIL_CAP]}"
+                    )
+                else:
+                    channel_fail_msg = (
+                        f"⏰ Cron: {job.name} ❌ Job failed on {host} — check logs.\n"
+                        f"{exc_summary[:_CRON_FAILURE_DETAIL_CAP]}"
+                    )
+                channel_fail_msg, _ = redact_exfiltration_urls(channel_fail_msg)
+                channel_fail_msg, _ = redact_credentials(channel_fail_msg)
                 # Silent jobs still execute but suppress notifications (UI bells
                 # AND Slack DMs). The failure is still logged at warning level
                 # and counted toward auto-pause above — we just skip
                 # user-facing noise.
                 slack_failed = False  # track real delivery exceptions only
-                if self.slack and not job.silent:
+                # Same governed channel-first ladder the success leg runs, for the
+                # same reason: a cron created from a non-Slack channel that starts
+                # crashing must say so where its results appear. Reporting success
+                # into the channel and failure only into the dashboard bell makes a
+                # broken job read as an idle one, and the success path is what
+                # taught the operator to expect the channel. ``job.silent`` gates
+                # this exactly as it gates the Slack DM, so a silent job stays
+                # silent on every surface.
+                channel_delivered = False
+                if job.session_key and not job.silent:
+                    channel_delivered = await self._deliver_channel_reply(
+                        job.session_key, channel_fail_msg
+                    )
+                if self.slack and not job.silent and not channel_delivered:
 
                     try:
                         channel = job.channel
@@ -4536,7 +4657,10 @@ class GatewayOrchestrator:
                 # advances — otherwise every identical failure re-notifies the
                 # dashboard, which is what dedup is supposed to prevent. Only the
                 # dedup fields are gated here; the failure count was already
-                # recorded above.
+                # recorded above. A channel-delivered alert never sets
+                # ``slack_failed`` and so advances here too — the anchor is
+                # delivery-agnostic, and a surface that delivers without advancing
+                # it can never suppress the next identical failure.
                 if not slack_failed:
                     job.last_failure_hash = fh
                     job.last_failure_at = time.time()
@@ -4548,8 +4672,14 @@ class GatewayOrchestrator:
                             session_key=f"cron:{job.id}",
                             tool_name="cron_failure_alert",
                             outcome="suppressed" if job.silent else "alerted",
+                            # The surface the alert actually reached, so the audit
+                            # trail distinguishes a channel-delivered failure
+                            # notice from a Slack one rather than naming Slack for
+                            # both.
                             downstream_service=(
-                                "slack" if (self.slack and not job.silent) else "none"
+                                channel_namespace_of(job.session_key)
+                                if channel_delivered
+                                else ("slack" if (self.slack and not job.silent) else "none")
                             ),
                         )
                     except Exception:
@@ -7091,7 +7221,9 @@ class GatewayOrchestrator:
     def _init_task_runner(self) -> None:
         """Initialize the task runner."""
 
-        async def _task_notify(title: str, body: str, task_id: str = "") -> None:
+        async def _task_notify(
+            title: str, body: str, task_id: str = "", *, session_key: str = ""
+        ) -> None:
             if self.dashboard_state:
                 body, _ = redact_exfiltration_urls(body)
                 body, _ = redact_credentials(body)
@@ -7105,14 +7237,32 @@ class GatewayOrchestrator:
             # (avoids false positives like "Investigating gateway error").
             if "requires approval" in title.lower() or "denied" in title.lower():
                 try:
+                    safe_t = redact_credentials(redact_exfiltration_urls(title)[0])[0]
+                    safe_b = redact_credentials(redact_exfiltration_urls(body)[0])[0]
+                    notice = f"*{safe_t}*\n{safe_b}"
+                    # Governed channel ladder first, owner DM as the fallback —
+                    # the same ordering the cron delivery path uses, and for the
+                    # same reason: a task blocked on an approval nobody was told
+                    # about is indistinguishable from a hung one. The owner DM
+                    # reaches Slack only, so a Telegram-only operator learned
+                    # nothing and the run simply stalled. ``session_key`` is the
+                    # ORIGINATING conversation, threaded down from
+                    # ``start_background``; it is empty for a dashboard- or
+                    # CLI-started run, and ``_deliver_channel_reply`` also
+                    # returns False for a Slack, dashboard or unrecognized key,
+                    # so the DM below is reached exactly as before in every case
+                    # that has no channel behind it.
+                    if session_key and await self._deliver_channel_reply(session_key, notice):
+                        return
                     if self.slack and self._owner_id:
-                        safe_t = redact_credentials(redact_exfiltration_urls(title)[0])[0]
-                        safe_b = redact_credentials(redact_exfiltration_urls(body)[0])[0]
                         ch = await self.slack.open_dm(self._owner_id)
                         if ch:
-                            await self.slack.post_message(ch, f"*{safe_t}*\n{safe_b}")
+                            await self.slack.post_message(ch, notice)
                 except Exception as exc:
-                    logger.warning("Failed to send approval notification to Slack DM: %s", exc)
+                    # Not "to Slack DM" any more: the try now spans the channel
+                    # ladder as well, so naming one surface would misdirect
+                    # whoever reads this line.
+                    logger.warning("Failed to send task approval notification: %s", exc)
 
         assert self.sessions is not None
         self.task_runner = TaskRunner(
@@ -9263,7 +9413,52 @@ class GatewayOrchestrator:
                 for m in enabled
             },
         )
+        # BEFORE starting: a channel that starts sets its own badge, so seeding
+        # first lets a success overwrite this and leaves it only where the factory
+        # bailed out early.
+        await loop.run_in_executor(maintenance_executor(), self._badge_unready_channels, boot)
         self._channel_handles = await registry.start_channels(self, descriptors, permitted)
+
+    def _badge_unready_channels(self, bootable: "tuple[ChannelDescriptor, ...]") -> None:
+        """Give an ENABLED channel that cannot start a reason the dashboard shows.
+
+        Each ``maybe_start_*`` returns None when a credential is missing, which is
+        correct but silent: it sets no ``<channel>_connect_error``, so
+        ``DashboardState.channel_status`` reports ``{connected: False, error: ""}``
+        -- byte-identical to a channel nobody configured. System > Services filters
+        that shape out (otherwise a Slack-only install grows seven meaningless
+        rows), so an operator who enabled Telegram and forgot the token saw a
+        healthy page and a bot that never answered.
+
+        Reported here rather than by widening that filter, because the filter is not
+        what is wrong: "enabled but not started" is a real state that owes a REASON,
+        and naming the missing credential is what the operator can act on. Derived
+        from ``channel_readiness``, which is descriptor-driven, so the next channel
+        is covered by adding its descriptor.
+
+        Runs in an executor: ``load_credentials`` reads the credential store.
+        Best-effort by construction -- a diagnostic badge must never be able to stop
+        a transport from booting.
+        """
+        try:
+            from kiro_crew.channels import channel_readiness
+
+            state = self.dashboard_state
+            if state is None:
+                return
+            bootable_types = {d.channel_type for d in bootable}
+            creds = self._cfg.load_credentials()
+            for row in channel_readiness(self._cfg, creds):
+                if row.channel_type not in bootable_types or row.ready or not row.enabled:
+                    continue
+                missing = [*row.missing_credentials, *row.missing_config]
+                setattr(
+                    state,
+                    f"{row.channel_type}_connect_error",
+                    f"Enabled but not started: missing {', '.join(missing)}"[:120],
+                )
+        except Exception:
+            logger.debug("channel readiness badge unavailable", exc_info=True)
 
 
 # Strong reference to the background slice-limit apply task: the event loop

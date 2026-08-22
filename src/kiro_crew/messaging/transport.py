@@ -205,6 +205,52 @@ class MessagingTransport(ABC):
         """Resolve an advertised target to ``(conversation_id, thread_id)``."""
         return None
 
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Whether a PROACTIVE send to this conversation is still authorized.
+
+        :meth:`authorize` gates a turn the user drove; this gates a message
+        nobody asked for -- a cron result, a compaction notice, a subagent
+        completion. Those resolve their destination from a **persisted**
+        ``ChannelLink``, which records a conversation but not the principal that
+        authorized it, so removing a recipient from the roster and restarting
+        leaves the link intact and the sends still flowing. Revocation has to be
+        re-decided at egress, and only the transport can decide it: the roster
+        holds principals while the link holds a conversation id, and whether
+        those are the same string is a per-platform fact (a Telegram private
+        ``chat_id`` IS the ``user_id``; a Discord DM channel id is not).
+
+        *principal* is the peer's platform id when the session key positively
+        names one (a 1:1 DM under the default scope), else ``""``. It is what
+        makes the answer reachable for a transport whose conversation id is
+        opaque: check it against the same roster :meth:`authorize` uses. Empty
+        means "the key does not name one principal" -- a room-audience route or a
+        unified bucket -- NOT that nobody is authorized, so a transport that can
+        only answer via the principal should permit rather than deny when it is
+        absent, or it would refuse every group and unified-scope send.
+
+        A transport whose conversation id already IS the roster identity (Telegram,
+        iMessage, WeCom, Weixin) can ignore *principal* and answer from
+        *conversation_id* alone, which also covers its room-audience routes.
+
+        Called on the shared send ladder (``chat_runner._resolve_channel_target``),
+        so it MUST stay synchronous and in-memory -- no network, no awaits. A
+        revocation check that needs a round trip would put an unbounded call on
+        every proactive send, and a check that can time out is a check that
+        fails open under load.
+
+        Defaults to True: a transport with no roster to consult would otherwise
+        have no way to deliver. That default is deliberately NOT relied on for
+        the shipped channels -- ``test_channel_transport_outbound_authz.py``
+        requires every transport under ``src/kiro_crew/<channel>/`` to override
+        this and make its own decision explicit, so a channel cannot inherit
+        permission silently. Override it and return False for a conversation
+        whose principal is no longer on the roster.
+        """
+        return True
+
     # -- Inbound adapter ----------------------------------------------------
     @abstractmethod
     async def receive(self, raw_envelope: Any) -> None:

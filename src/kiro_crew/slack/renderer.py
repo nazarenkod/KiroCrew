@@ -528,7 +528,7 @@ class SlackRenderer(Renderer):
             self._stream_buffer = ""
 
     async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
+        self, options: list[dict[str, Any]], request_id: str | int, tool_input: str = ""
     ) -> None:
         title = options[0].get("label") or options[0].get("id", "tool") if options else "tool"
         # Namespace the approval buttons by this turn's session so a click can

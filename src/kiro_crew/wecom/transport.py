@@ -113,6 +113,25 @@ class WeComTransport(MessagingTransport):
         # No addressable DM channel id; the userid is the logical conversation.
         return user_id
 
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Mirror :meth:`authorize` on the userid the conversation id carries.
+
+        Defence in depth rather than the live gate: WeCom declares
+        ``supports_proactive_send=False``, so the shared send ladder refuses this
+        transport before asking. Implemented anyway, and fail-closed, so the
+        answer is already correct if that capability is ever flipped -- and
+        because ``send_message`` also accepts a one-shot ``response_url`` as its
+        conversation id, which is not a roster identity and is therefore refused.
+        """
+        if not conversation_id:
+            return False
+        if self._allow_all:
+            return True
+        return conversation_id == self._owner_id or conversation_id in self._allowed
+
     async def fetch_history(
         self, conversation_id: str, thread_id: str | None = None
     ) -> list[InboundMessage]:

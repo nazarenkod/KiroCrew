@@ -111,7 +111,10 @@ class TeamsRenderer(Renderer):
         await self._client.send_typing(self._conversation_id, self._service_url)
         self._last_typing = now
 
-    async def on_prompt_choice(self, options: list[dict[str, Any]], request_id: str | int) -> None:
+    async def on_prompt_choice(
+        self, options: list[dict[str, Any]], request_id: str | int, tool_input: str = ""
+    ) -> None:
+        # tool_input is accepted and ignored: this renderer runs decider-less.
         # Driver only dispatches prompt_choice for INTERACTIVE + a decider, and
         # Teams runs decider-less (deny-by-default) -- safe no-op.
         logger.debug("Teams: prompt_choice ignored (no interactive buttons)")

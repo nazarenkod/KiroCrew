@@ -50,6 +50,12 @@ def schemas() -> list[dict[str, Any]]:
                 " this cron. Falls through to notification-only if origin is"
                 " unreachable (tab closed, history deleted, or cron has no origin)."
                 "\n\nExplicit channel=... or user=... always sends to Slack."
+                "\n\nOn a non-Slack messaging channel (Telegram, Discord, Teams, "
+                "Webex, WeCom, Weixin, WhatsApp, iMessage) set 'channel_type' to "
+                "that channel's name to post into the conversation you are already "
+                "talking in — that is the only way a message reaches the user "
+                "there. 'channel', 'user' and 'thread_ts' are Slack-only and are "
+                "rejected alongside it."
             ),
             "inputSchema": {
                 "type": "object",
@@ -70,11 +76,27 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "channel": {
                         "type": "string",
-                        "description": "Target channel ID (e.g. C0123ABC456). Must be a tracked channel. Omit to send to owner DM.",
+                        "description": "Slack-only. Target channel ID (e.g. C0123ABC456). Must be a tracked channel. Omit to send to owner DM.",
                     },
                     "user": {
                         "type": "string",
-                        "description": "Target user ID (e.g. U0123ABC456) to DM. Must be an allowed user. Omit to send to owner DM.",
+                        "description": "Slack-only. Target user ID (e.g. U0123ABC456) to DM. Must be an allowed user. Omit to send to owner DM.",
+                    },
+                    "channel_type": {
+                        "type": "string",
+                        "description": (
+                            "Deliver into the non-Slack messaging conversation this "
+                            "session belongs to, named by its transport: "
+                            '"telegram", "discord", "teams", "webex", "wecom", '
+                            '"weixin", "whatsapp" or "imessage". Use it when the '
+                            "[RUNTIME] marker says you are talking over one of "
+                            "those channels and you want a proactive message "
+                            "(a silent cron's report, a finished background task) "
+                            "to reach the user THERE rather than only in the "
+                            'dashboard bell. Not for Slack — use session="slack". '
+                            "Cannot be combined with 'channel', 'user' or "
+                            "'thread_ts', which are Slack-only routing fields."
+                        ),
                     },
                     "unfurl_links": {
                         "type": "boolean",
@@ -259,6 +281,22 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     text = args["text"]
     title = args.get("title", "Agent Message")
     payload = {"text": text, "title": title}
+    # ``channel_type`` names a non-Slack transport and is mutually exclusive with
+    # the Slack-only routing fields. Refused with a message rather than resolved
+    # by precedence: either order silently drops a destination the caller named,
+    # and the caller cannot tell which one it lost.
+    channel_type = str(args.get("channel_type") or "").strip()
+    if channel_type:
+        conflicting = [key for key in ("channel", "user", "thread_ts") if args.get(key)]
+        if args.get("session") == "slack":
+            conflicting.append('session="slack"')
+        if conflicting:
+            return (
+                f"Error: channel_type={channel_type!r} cannot be combined with "
+                f"{', '.join(conflicting)} — those route to Slack only. Send one "
+                "message per destination."
+            )
+        payload["channel_type"] = channel_type
     if args.get("blocks"):
         payload["blocks"] = args["blocks"]
     if args.get("channel"):
@@ -282,13 +320,35 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     # "cron → Slack DM by default" routing and report where the message
     # actually landed.
     caller_session = mcp_core._resolve_session_key()
+    # A channel_type send posts into ONE named conversation, so it is resolved
+    # STRICTLY. The lenient resolver walks process ancestors, and a sub-agent
+    # resolving to its parent would deliver into the parent's conversation —
+    # someone else's chat window. Refuse rather than guess; the strict sources
+    # (gateway-injected caller context, injected session key, HMAC-verified host
+    # pid) are all published by the channel transports, so this is reachable on
+    # every surface that can legitimately ask for it.
+    verified_session = ""
+    if channel_type:
+        verified_session = mcp_core._resolve_session_key_strict()
+        if not verified_session:
+            return (
+                "Error: cannot verify caller identity for a channel_type send "
+                "(no gateway-injected session key or HMAC-verified pid). "
+                "Refusing to post into a conversation that cannot be attributed."
+            )
+    # ``gov_session`` is the identity every gate below is keyed on. It is the
+    # STRICT key whenever one was required, so the identity that is checked is
+    # the identity the request is later sent under (``_post`` gets the same
+    # value); re-resolving leniently after a strict gate would check one session
+    # and write as another.
+    gov_session = verified_session or caller_session
     # Channel-agent containment: channel agents
     # communicate exclusively through channel posts. The channel.py
     # permission-request guard only fires when kiro-cli ASKS — an
     # auto-approved kirocrew-core call (default allowedTools) emits no
     # permission event — so the boundary must also hold here at MCP
     # dispatch, keyed on the verified caller identity.
-    _chan_deny = mcp_core._deny_channel_agent_messaging(caller_session, "send_message")
+    _chan_deny = mcp_core._deny_channel_agent_messaging(gov_session, "send_message")
     if _chan_deny:
         return _chan_deny
     is_cron = caller_session.startswith("cron:")
@@ -296,39 +356,59 @@ def send_message(name: str, args: dict[str, Any]) -> str:
         payload["caller_session"] = caller_session
     # Governance: outbound messaging is a capability gate (exfil surface).
     # A policy/profile may disable proactive messaging for a surface/app.
-    _gov_msg = mcp_core._vet_messaging_governance(caller_session)
+    _gov_msg = mcp_core._vet_messaging_governance(gov_session)
     if _gov_msg:
         return f"Error: {_gov_msg}"
     # Governance: the per-transport ``channels`` allowlist is finer-grained
     # than the on/off messaging gate — a policy may permit messaging but
-    # restrict it to specific transports (e.g. Slack only). Slack is the only
-    # transport Kiro Crew sends over today. The gateway routes a send to Slack
-    # whenever session=="slack" OR an explicit channel/user is set OR the
-    # caller is a cron (see messaging.api_send_message), so we mirror that
-    # exact predicate here — checking only session=="slack" would let a
-    # channel=/user=-addressed send reach Slack while bypassing the gate. A
-    # bare send (no session/channel/user, non-cron) is the in-process
-    # dashboard notification path, governed by the messaging gate above.
+    # restrict it to specific transports (e.g. Slack only). The gate must name
+    # the transport the message will ACTUALLY leave over, not a stand-in: vetting
+    # "slack" for a Telegram send would evaluate a Telegram denial against
+    # Slack's rule and let it through (or refuse a permitted Telegram send
+    # because Slack is denied).
+    #
+    # The two are exclusive, mirroring the gateway. A channel_type send
+    # suppresses the Slack leg there (a failed channel delivery must not fall
+    # through to an audience the caller never named), so Slack is not a
+    # destination of this call at all. Otherwise the gateway routes to Slack
+    # whenever session=="slack" OR an explicit channel/user is set OR the caller
+    # is a cron (see messaging.api_send_message), so we mirror that exact
+    # predicate — checking only session=="slack" would let a channel=/user=
+    # -addressed send reach Slack while bypassing the gate. A bare send (no
+    # session/channel/user/channel_type, non-cron) is the in-process dashboard
+    # notification path, governed by the messaging gate above.
     slack_bound = (
         payload.get("session") == "slack"
         or bool(payload.get("channel"))
         or bool(payload.get("user"))
         or is_cron
     )
-    if slack_bound:
-        _gov_chan = mcp_core._vet_channel_governance(caller_session, "slack")
+    target_transport = channel_type or ("slack" if slack_bound else "")
+    if target_transport:
+        _gov_chan = mcp_core._vet_channel_governance(gov_session, target_transport)
         if _gov_chan:
             return f"Error: {_gov_chan}"
-    resp = mcp_core._post("/api/send-message", payload)
+    if verified_session:
+        resp = mcp_core._post("/api/send-message", payload, session_key=verified_session)
+    else:
+        resp = mcp_core._post("/api/send-message", payload)
     if not resp.get("ok"):
+        if resp.get("code") == "channel_delivery_failed":
+            # "Error:" prefix: call_tool_with_logging classifies only
+            # "Error:"-prefixed returns as failures, and a channel send that
+            # reached nobody must land in the audit trail as one — "Failed:"
+            # would be recorded as a completed call.
+            return f"Error: {resp.get('error') or resp}"
         return f"Failed: {resp}"
     # Prefer the gateway's explicit delivery channel when present
-    # (delivered_to ∈ {"slack", "session", "notification"}); fall back to
-    # the legacy slack/session booleans for older gateways.
+    # (delivered_to ∈ {"slack", "session", "channel", "notification"}); fall
+    # back to the legacy slack/session booleans for older gateways.
     delivered_to = resp.get("delivered_to")
     ts = resp.get("ts", "")
     if delivered_to == "session" or (delivered_to is None and resp.get("session")):
         return "Message injected into target session."
+    if delivered_to == "channel":
+        return f"Message posted to the {channel_type or 'channel'} conversation."
     if delivered_to == "slack" or (delivered_to is None and resp.get("slack")):
         return (
             f"Message sent to Slack + notification. ts={ts}"

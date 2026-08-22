@@ -22,6 +22,7 @@ import pytest
 
 from conftest import MockSlackClient
 from kiro_crew.config.loader import ConfigReadError
+from kiro_crew.messaging import commands as mc
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.slack import handler as h
 
@@ -489,7 +490,7 @@ class TestUnknownBangCommand:
 class TestCommandHelperEarlyReturns:
     def test_spawn_with_no_task_declines(self):
         manager = MagicMock()
-        assert h._do_spawn("", manager) is None
+        assert mc.spawn_task_reply("", manager) is None
         manager.spawn.assert_not_called()
 
     def test_spawn_keyword_without_prefix_declines(self):

@@ -42,7 +42,7 @@ class _RecordingRenderer(Renderer):
     async def on_tool_call(self, tool_call_id, title, tool_kind="", tool_purpose=""):
         self.events.append(("tool_call", tool_call_id, title))
 
-    async def on_prompt_choice(self, options, request_id):
+    async def on_prompt_choice(self, options, request_id, tool_input=""):
         self.events.append(("prompt_choice", options, request_id))
 
     async def on_compaction(self, pct):

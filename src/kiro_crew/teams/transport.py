@@ -132,6 +132,32 @@ class TeamsTransport(MessagingTransport):
             return None
         return conversation_id, None
 
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Authorize a proactive send by reverse-mapping the conversation.
+
+        Teams links persist a conversation id, not a principal, so the roster is
+        reached through ``_conversations_by_user`` -- the same map
+        ``resolve_configured_target`` uses. A conversation is authorized only
+        while some CURRENTLY allow-listed identity still maps onto it, so
+        dropping an identity from the allow-list stops its proactive traffic.
+
+        That map is in-memory and repopulates from inbound, so nothing is
+        authorized here until the peer speaks after a restart. That costs
+        nothing: ``send_message`` needs a ``serviceUrl`` from the same
+        inbound-populated dict, so a Teams proactive send was already impossible
+        in exactly that window.
+        """
+        if not conversation_id:
+            return False
+        return any(
+            conversation == conversation_id
+            for identity, conversation in self._conversations_by_user.items()
+            if identity in self._allowed
+        )
+
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
         await self._client.connect()

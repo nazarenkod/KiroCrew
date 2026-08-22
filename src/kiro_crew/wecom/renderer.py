@@ -132,7 +132,7 @@ class WeComRenderer(Renderer):
         await self._push(force=True)
 
     async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
+        self, options: list[dict[str, Any]], request_id: str | int, tool_input: str = ""
     ) -> None:
         # WeCom has no interactive buttons. The driver only dispatches
         # prompt_choice for INTERACTIVE + a decider, and WeCom runs decider-less

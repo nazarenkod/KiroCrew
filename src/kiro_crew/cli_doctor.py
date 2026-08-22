@@ -897,14 +897,8 @@ def _doctor_trust_root() -> None:
         print(f"  trust root:  ⏹ {key_path} not created yet (the gateway writes it on first start)")
         return
     print(f"  ⚠ trust root: {key_path} is unreadable or shorter than 32 bytes.")
-    print(
-        "               Session identities go out unsigned, so sub-agent "
-        "dispatch and memory"
-    )
-    print(
-        "               writes are refused in sandboxed sessions. Restore the "
-        "key file, or"
-    )
+    print("               Session identities go out unsigned, so sub-agent " "dispatch and memory")
+    print("               writes are refused in sandboxed sessions. Restore the " "key file, or")
     print("               restart the gateway if another process relocated it.")
 
 
@@ -1230,7 +1224,9 @@ def _doctor_source_checkout(repo: Path) -> None:
             print(f"  branch:      ⚠️  {default_branch} (could not count commits behind origin)")
             return
         if int(behind) > 0:
-            print(f"  branch:      ⚠️  {default_branch}, {behind} commit(s) behind origin (as of last fetch)")
+            print(
+                f"  branch:      ⚠️  {default_branch}, {behind} commit(s) behind origin (as of last fetch)"
+            )
             print("               The running gateway predates those commits until an")
             print("               update + restart.")
         else:
@@ -2167,9 +2163,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         # tree would send them to reinstall a package they are deliberately not
         # loading from, while saying nothing about the dir that actually failed.
         _plat_dir = _platform_libs_dirname()
-        _absent = (
-            [] if _lib_path_override else verify_vendored_libs().get(_plat_dir or "", [])
-        )
+        _absent = [] if _lib_path_override else verify_vendored_libs().get(_plat_dir or "", [])
         if _absent:
             print(f"               Missing native libs for {_plat_dir}: {', '.join(_absent)}")
             print("               This install's vendored llama.cpp is incomplete (packaging")
@@ -2339,6 +2333,47 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         print("  status:      ⏭  not configured (optional)")
         print("  setup:       run 'kirocrew setup --slack', or connect any channel")
         print("               (Slack, Discord, Telegram, …) from the dashboard")
+
+    # ── Every other channel (optional) ──
+    # One loop over the roster rather than a section per channel: before this the
+    # doctor knew only about Slack, so an operator with `telegram.enabled: true`
+    # and no token got a clean bill of health from the tool whose whole job is
+    # telling them what is wrong. Readiness is derived from descriptor data, so
+    # the next channel is covered by adding its descriptor.
+    print("\nOther Channels")
+    try:
+        from kiro_crew.channels import channel_readiness
+
+        rows = [row for row in channel_readiness(cfg, creds) if row.channel_type != "slack"]
+    except Exception:
+        rows = []
+        print("  status:      ⚠️  channel roster unavailable")
+    if rows and not any(row.enabled for row in rows):
+        print("  status:      ⏭  none enabled (optional)")
+        print("  setup:       connect one from the dashboard's Settings > Channels")
+    for row in rows:
+        if not row.enabled:
+            continue
+        name = row.channel_type
+        if row.ready:
+            print(f"  {name + ':':12} ✅ enabled, credentials present")
+        else:
+            # Credentials and required config are reported separately because they
+            # live in different places: a secret belongs in .env, a non-secret like
+            # an account id in config.json. One combined line would send the
+            # operator to the wrong file.
+            parts = []
+            if row.missing_credentials:
+                parts.append(", ".join(row.missing_credentials))
+            if row.missing_config:
+                parts.append(", ".join(f"{name}.{attr}" for attr in row.missing_config))
+            missing = " and ".join(parts)
+            print(f"  {name + ':':12} ❌ enabled but missing {missing}")
+            print(
+                "               The channel will not start. Set it in "
+                "Settings > Channels, or in ~/.kiro/crew/.env"
+            )
+            issues.append(f"{name}: missing {missing}")
 
     # ── Loop-stall crash dumps ──
     print("\nLoop-stall Crash Dumps")

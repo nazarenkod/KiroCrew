@@ -102,7 +102,11 @@ vi.mock('../components/TerminalKeyBar', () => ({ default: () => <div data-testid
 const touch = vi.hoisted(() => ({ value: false }))
 vi.mock('../hooks/useIsTouchDevice', () => ({ useIsTouchDevice: () => touch.value }))
 
-import CliPanel, { disposeTerminalSession, useDeleteTerminalSession } from '../components/CliPanel'
+import CliPanel, {
+  disposeTerminalSession,
+  useDeleteTerminalSession,
+  __resetCliPanelThemeObserver,
+} from '../components/CliPanel'
 import { setTerminalFontSize, __resetTerminalFontStore } from '../hooks/useTerminalFont'
 
 /* ── harness ──────────────────────────────────────────────────────────────── */
@@ -547,6 +551,14 @@ describe('CliPanel theme and font sync', () => {
   })
 
   it('repaints when a custom-theme style element resolves into <head>', async () => {
+    // Freshly attach the module-level theme observer. It is created once per
+    // module and therefore outlives a test, and a long-lived happy-dom observer
+    // keeps delivering the `attributes` records it is registered for while
+    // silently dropping the `<head>` `childList` ones — so without this the
+    // assertion below waits out its timeout against a mutation the observer will
+    // never report. A fresh observer is also the app's real state when a custom
+    // theme resolves, so this makes the test measure the shipped path.
+    __resetCliPanelThemeObserver()
     const { term } = mount()
     // Drain records queued by earlier tests so the only mutation the observer
     // sees here is the <head> insertion (a custom theme's vars arrive that way,
@@ -556,6 +568,13 @@ describe('CliPanel theme and font sync', () => {
     style.id = 'mc-custom-theme-probe'
     style.textContent = ':root { --accent: #ff8800; }'
     act(() => { document.head.appendChild(style) })
+    // One macrotask turn so the observer's callback is DELIVERED before the
+    // assertion. `waitFor` alone is not enough: it polls, and its polling does
+    // not itself produce the turn happy-dom needs to dispatch a queued
+    // MutationObserver record — so the assertion retried for its full timeout
+    // against a callback that had not run yet. The same drain idiom this file
+    // already uses above, on the other side of the mutation.
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
     await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
   })
 
@@ -568,6 +587,7 @@ describe('CliPanel theme and font sync', () => {
     // terminal stops tracking the app theme for the life of the page. Reproduced
     // deterministically here rather than waiting for the load-dependent version
     // of it to bite a CI shard.
+    __resetCliPanelThemeObserver()
     const { term } = mount()
     await act(async () => { await new Promise(r => setTimeout(r, 0)) })
 
@@ -583,10 +603,22 @@ describe('CliPanel theme and font sync', () => {
     style.textContent = ':root { --accent: #ff8800; }'
     act(() => { document.head.appendChild(style) })
 
+    // One macrotask turn so the observer's callback is DELIVERED before the
+    // assertion. `waitFor` alone is not enough: it polls, and its polling does
+    // not itself produce the turn happy-dom needs to dispatch a queued
+    // MutationObserver record — so the assertion retried for its full timeout
+    // against a callback that had not run yet. The same drain idiom this file
+    // already uses above, on the other side of the mutation.
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
     await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
   })
 
   it('ignores an unrelated style element added to <head>', async () => {
+    // Fresh observer, and a POSITIVE control at the end. Without both, this test
+    // is vacuous: it asserts that nothing happened, which is also true of an
+    // observer that cannot report anything — so it passed even while the
+    // custom-theme path was entirely unobserved.
+    __resetCliPanelThemeObserver()
     const { term } = mount()
     // Drain any observer records queued by earlier tests before measuring.
     await act(async () => { await new Promise(r => setTimeout(r, 0)) })
@@ -596,6 +628,16 @@ describe('CliPanel theme and font sync', () => {
     act(() => { document.head.appendChild(style) })
     await act(async () => { await new Promise(r => setTimeout(r, 0)) })
     expect(term.options.theme).toBe(before) // same object → no refresh ran
+
+    // Control: the SAME observer, same insertion point, an id it does watch.
+    // This is what makes the assertion above mean "ignored" rather than "unheard".
+    const themed = document.createElement('style')
+    themed.id = 'mc-custom-theme-control'
+    themed.textContent = ':root { --accent: #ff8800; }'
+    act(() => { document.head.appendChild(themed) })
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    expect(term.options.theme).not.toBe(before)
+    expect(term.options.theme?.cursor).toBe('#ff8800')
   })
 
   it('pushes a font-size preference change onto every live terminal and refits', () => {

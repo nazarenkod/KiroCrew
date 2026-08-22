@@ -55,6 +55,11 @@ class OutputEvent:
     tool_purpose: str = ""  # tool_call (human-readable purpose -> task title)
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
     request_id: str | int = ""  # prompt_choice correlation
+    # prompt_choice: the tool's own arguments, redacted, so a renderer can show
+    # WHAT is being approved rather than only its name. "" when the provider
+    # supplied none, which a renderer must treat as "no detail available" —
+    # never as "no arguments".
+    tool_input: str = ""
     context_usage_pct: float = 0.0  # compaction
     stop_reason: str = ""  # done
 
@@ -67,6 +72,7 @@ class OutputEvent:
             "tool_kind": self.tool_kind,
             "tool_purpose": self.tool_purpose,
             "options": [dict(o) for o in self.options],
+            "tool_input": self.tool_input,
             "request_id": self.request_id,
             "context_usage_pct": self.context_usage_pct,
             "stop_reason": self.stop_reason,
@@ -179,17 +185,28 @@ def apply_options_cap(
 
     Returns ``(body, kept_choices)``:
 
-    * ``len(choices) <= max_buttons`` — byte-identical pass-through.
+    * ``len(choices) <= max_buttons`` — the choices, display-redacted.
     * overflow — the first ``max_buttons`` choices are kept for the widget;
       the remainder is appended to ``body`` as a numbered text list
       (numbering continues after the widget slots) rather than dropped, so
       the user still learns those choices exist.
     * ``max_buttons <= 0`` — returns ``(body, [])``; zero-widget channels
       own their trailer handling (today: strip).
+
+    **The KEPT choices are redacted, not just the overflow.** A choice label is
+    LLM-authored text rendered into a channel, exactly like the overflow list, and
+    the overflow was the only half that ran through :func:`display_safe`. So a
+    markup-split credential inside a label rendered intact on the button — and again
+    in the press echo, which quotes the label back — while the same string in the
+    overflow list was redacted. On a forum Topic that is every allow-listed
+    participant. Slack redacts at this same point (``slack/format.py``'s
+    ``_redact_choices``); this closes the gap for every widget channel at once
+    rather than per renderer, so a channel added later cannot miss it.
     """
     if capabilities.max_buttons <= 0:
         return body, []
     kept, overflow = cap_choices(choices, capabilities)
+    kept = [display_safe(c) for c in kept]
     if not overflow:
         return body, kept
     lines = format_overflow(overflow, start=len(kept))
@@ -259,9 +276,16 @@ class Renderer(ABC):
 
     @abstractmethod
     async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
+        self, options: list[dict[str, Any]], request_id: str | int, tool_input: str = ""
     ) -> None:
-        """Render an interactive approval/choice prompt (first-class)."""
+        """Render an interactive approval/choice prompt (first-class).
+
+        ``tool_input`` is the tool's own arguments, already redacted, so a renderer
+        can show WHAT is being approved rather than only its name. Declared with a
+        safe default and passed unconditionally: a renderer that has nowhere to put
+        it ignores the argument, which keeps the call site free of a capability
+        probe. ``""`` means the provider supplied no detail — never "no arguments".
+        """
 
     @abstractmethod
     async def on_compaction(self, context_usage_pct: float) -> None:
@@ -291,7 +315,7 @@ class Renderer(ABC):
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )
         elif event.kind == PROMPT_CHOICE:
-            await self.on_prompt_choice(event.options, event.request_id)
+            await self.on_prompt_choice(event.options, event.request_id, event.tool_input)
         elif event.kind == COMPACTION:
             await self.on_compaction(event.context_usage_pct)
         elif event.kind == DONE:
@@ -361,7 +385,7 @@ class SilentRenderer(Renderer):
         return None
 
     async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
+        self, options: list[dict[str, Any]], request_id: str | int, tool_input: str = ""
     ) -> None:
         return None
 

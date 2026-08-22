@@ -85,6 +85,24 @@ function ensureThemeObserver() {
   _themeObserver.observe(document.head, { childList: true })
 }
 
+/** Test-only: drop the module-level theme observer so the next mount re-attaches.
+ *
+ * The observer is created ONCE per module (multiple terminal tabs must not each
+ * spawn one), which makes it outlive an individual test. That is correct in the
+ * app and a problem in a suite: a long-lived happy-dom MutationObserver keeps
+ * delivering the `attributes` records it is registered for and stops delivering
+ * the `<head>` `childList` ones, so a test asserting the custom-theme path
+ * measures an observer that will never report the mutation it just made. Calling
+ * this first gives that test a freshly attached observer, which is also the state
+ * the app is in when a custom theme actually resolves.
+ */
+export function __resetCliPanelThemeObserver(): void {
+  _themeObserver?.disconnect()
+  _themeObserver = null
+  if (_themeRaf) cancelAnimationFrame(_themeRaf)
+  _themeRaf = 0
+}
+
 /* ── Terminal font sync ──
  * Push the app-wide terminal font preference (useTerminalFont) onto every
  * cached xterm instance when it changes. Font family and size are canvas cell
