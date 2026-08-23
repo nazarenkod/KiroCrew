@@ -374,6 +374,54 @@ with the link test removed: the live archive segment is enumerated as a batch an
 `empty_trash()` additionally re-resolves each target and confirms it is inside the
 trash root, so a tampered manifest cannot direct the delete outside it.
 
+Within a batch the delete removes the files the MANIFEST names, one at a time, and
+never discovers a file by walking. That is what lets progress be reported per file
+rather than per batch, and it is also the safer form: a walk has to decide per entry
+whether to descend, and on Windows a junction is not a symlink — `os.path.islink`
+reports False for one — so a walk descends into it and unlinks the files it points at,
+outside the trash. Directory removal is still `shutil.rmtree`.
+
+The batch itself is opened by walking from the filesystem ROOT, one component at a
+time with `O_NOFOLLOW`, because that flag constrains only the last component: opening
+the batch by path left the trash root and everything above it - writable by the same
+user - to be re-resolved, so an ancestor swapped to a link after validation was
+followed. The path walked is the RESOLVED one, so this cannot refuse an install whose
+data home legitimately sits behind a symlinked home directory.
+
+Each named file is then removed by `(directory fd, name)`, with every directory
+component opened `O_NOFOLLOW` from the batch down, and the emptied directories go
+the same way - bottom-up by descriptor, including the batch itself through its
+parent's descriptor. NO step of that path resolves a path: finishing with
+`rmtree(batch)` re-resolved the whole prefix, so an ancestor swapped at that moment
+sent the removal outside the trash even though the walk above it was pinned.
+
+The sweep removes directories and LINKS but never a regular file it does not
+recognise: callers reach it only after the unlisted-file guard has passed, so a
+regular file appearing there is unaccounted-for data and the batch is reported as
+kept instead. A link is removed because removing a link destroys nothing, and
+leaving one would make a batch holding it impossible to empty for good. Checking a path and then unlinking it
+re-resolves the prefix, so a component swapped to a link in between is followed;
+nothing here resolves a path at unlink time, so there is no window to win. Where the
+platform supports neither `openat` nor `O_NOFOLLOW` (Windows) the batch takes
+`rmtree` and progress degrades to one report per batch — a smoother bar is not worth
+a weaker delete.
+
+Every manifest name goes through one validator, `_plain_parts`, before it is stat'd or
+unlinked. Absoluteness is asked of the PATH in BOTH flavours rather than by comparing
+components against separator spellings: `PurePosixPath("//tmp/x").parts` is
+`("//", "tmp", "x")`, whose root a check against `"/"` misses, and an absolute path
+handed to `os.open` ignores `dir_fd` entirely; on Windows `..\x` is a parent reference
+and `C:\x` is absolute, neither of which POSIX parsing sees. A Windows DRIVE is refused
+separately from absoluteness, because they are different questions: `C:.ssh/id_rsa` is
+drive-relative and not absolute, yet joining it onto the batch replaces the anchor and
+resolves against that drive's working directory, so the size read would stat a file
+outside the batch and report its existence and size. Refusing any `.drive` also catches
+`c:y`, and as collateral refuses a POSIX file named `a:b` — accepted, since this store
+names its own files and the cost is a batch kept as incomplete rather than an escape.
+The rule lives at the
+name because the version that wrote it at one call site left the sibling size read
+statting whatever the manifest said.
+
 Restore refuses a staged path that is a **symlink**, because `is_file()` follows
 links: one resolving inside the batch passes the `rel` validation, and moving it
 would put a link where the session's data belongs — leaving a dangling pointer once
@@ -452,20 +500,80 @@ SEL. Every non-2xx body carries a machine-readable `code`.
 | POST | `/api/system/session-storage/cleanup` | Stage sessions older than a threshold; `dry_run` reports without moving |
 | POST | `/api/system/session-storage/trash` | Stage an explicit selection of `uids`; reports `refused` per uid |
 | POST | `/api/system/session-storage/restore` | Return a batch, or named sessions within it |
-| POST | `/api/system/session-storage/empty` | Delete staged batches for good; needs `batch_ids` or `all: true` |
+| POST | `/api/system/session-storage/empty` | Start deleting staged batches for good; needs `batch_ids` or `all: true`. Answers **202** with a job |
+| GET | `/api/system/session-storage/empty` | The running or recently-finished empty, or `{"job": null}` |
 
 Rows are sorted biggest-first on the **units**, before the payload is built:
 sorting heterogeneous dicts does not type-check.
 
-The GET is uncached: it walks both stores, so it is meant to be fetched when a
-screen opens or after an action, not on a poll. Every operation is offloaded with
-`asyncio.to_thread` because a store reaching six figures of files is far too much
-filesystem work for the event loop.
+The GET on the collection is uncached: it walks both stores, so it is meant to be
+fetched when a screen opens or after an action, not on a poll. Every operation is
+offloaded with `asyncio.to_thread` because a store reaching six figures of files is
+far too much filesystem work for the event loop.
+
+`GET .../empty` is the exception that CAN be polled, and only because it reads
+counters this process already holds and touches no store.
 
 Error codes: `restricted_session` (403), `unknown` (404, no such uid on the detail
 route), `invalid_body`, `invalid_threshold`, `cleanup_refused`, `invalid_batch`,
 `invalid_uid`, `invalid_selection`, `selection_too_large`, `nothing_specified`,
-`trash_refused`, `restore_refused`, `empty_refused` (400).
+`trash_refused`, `restore_refused`, `empty_refused` (400), `empty_in_progress`
+(409, an empty is already running — the body carries that job under `job`).
+
+### Emptying is a job, not a response
+
+Emptying tens of thousands of staged sessions is minutes of filesystem work. Holding
+the request open for it left a client unable to say anything during the run: the only
+irreversible operation in this surface, and no way to tell a running delete from a
+stuck one. So the POST resolves what it will destroy, starts the work, and answers
+202 with a job; progress is read from the GET.
+
+The job is process-local, single-slot and NOT persisted. A second empty is refused
+with 409 rather than queued (the storage mutation lock would serialize it anyway, and
+one "working" state for two operations says nothing about either), and a job that
+outlived its gateway would claim a delete is running when no thread is.
+
+Its shape is `job_id`, `running`, `total_bytes`, `freed_bytes`, `error`, `skipped`.
+`total_bytes` is what the staged manifests say the resolved batches hold — the same
+figure the trash listing showed — so it is a denominator, not a remeasurement.
+Progress is counted in BYTES, not sessions: the delete walks files and a session is
+more than one file.
+
+Two properties are load-bearing:
+
+* **The set is resolved at request time, under the mutation lock, not in the
+  worker.** `staged_targets()` takes the same lock staging holds, because
+  `list_trash()` does not: an unlocked read can see a batch whose directory and
+  manifest header exist while its sessions are still being moved in, and selecting
+  that id makes the delete wait for staging and then destroy the finished batch -
+  sessions the user never saw included. Under the lock a batch is either fully staged
+  or not visible. Explicit ids are resolved through `_batch_dir()` first, the way
+  every other caller resolves one: filtering the staged list alone silently dropped an
+  id that is not a batch, so the worker got an empty list and the caller was told a
+  delete it asked for had succeeded. A bad id is still a 400 `empty_refused`, and so is a well-formed id whose batch is
+  no longer staged: `_batch_dir()` does not require the directory to exist, and
+  filtering such an id out turned "destroy this" into a zero-byte success. `empty_trash(None)`
+  enumerates the trash when it runs, which is now well after the click and can queue
+  behind another mutation — so a batch staged in between would be destroyed although
+  the user never saw it, and a staged batch is the only copy of those sessions. The
+  handler resolves ids up front and hands the worker an explicit list. If that read
+  fails for `all: true` the job settles with a reason and deletes NOTHING; for an
+  explicit selection it proceeds, because the caller already named the set.
+* **A finished job stops being reported after `_JOB_TTL_SECONDS`.** The slot would
+  otherwise hold the last outcome for the life of the process and a screen would
+  present it as current days later. The cutoff is applied server-side, where the
+  clock is, so no client needs a timestamp.
+
+`skipped` carries `SKIP_*` reason codes for every batch that is still there
+afterwards, whether it was refused up front or survived its own delete: the delete
+checks as a POST-CONDITION that the directory is gone, because
+`rmtree(ignore_errors=True)` reports nothing and a tree it could not remove otherwise
+left the batch on screen under a job that said it had succeeded.
+
+`skipped` carries codes for batches deliberately KEPT. That is a
+refusal a user has to be told: keeping a batch raises nothing, so an outcome read
+only from the exception reported "0 bytes freed, success" above a batch still on
+screen, with the reason in a log the user cannot read.
 
 A selection larger than `_MAX_SELECTION` stages the **oldest** that many sessions
 and returns `remaining` rather than refusing. Refusing would dead-end the install

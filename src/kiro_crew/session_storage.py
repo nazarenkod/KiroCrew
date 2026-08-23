@@ -67,13 +67,14 @@ import logging
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import IO, Any
 
 from kiro_crew import hooks, platform_compat
@@ -1200,16 +1201,9 @@ def _unlisted_files(batch: Path) -> list[Path]:
     unreadable directories silently, which would turn a transient error into
     permission to delete a file that is the only copy of a session.
     """
-    parsed = _read_manifest(batch)
-    listed: set[str] = set()
-    if parsed is not None:
-        for entry in parsed[1]:
-            files = entry.get("files")
-            if not isinstance(files, list):
-                continue
-            for record in files:
-                if isinstance(record, dict) and isinstance(record.get("rel"), str):
-                    listed.add(record["rel"])
+    # An unreadable manifest yields no listed names, so every file below counts as
+    # unlisted — the safe direction this docstring describes.
+    listed: set[str] = set(_manifest_rels(batch))
     failures: list[OSError] = []
     unlisted = []
     for root, _dirs, names in os.walk(batch, onerror=failures.append):
@@ -1735,45 +1729,488 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
     return restored
 
 
-def _dir_bytes(root: Path) -> int:
-    """Total size of every file under *root*, recursively.
+# Called with the running total of bytes freed by an empty. See :func:`empty_trash`.
+EmptyProgress = Callable[[int], None]
 
-    Uses the stat the directory walk already produced: a batch can hold hundreds
-    of thousands of files, where a separate ``Path.stat()`` per file dominates.
+#: Called with a reason code when a batch is kept instead of deleted. See
+#: :func:`empty_trash`.
+EmptySkip = Callable[[str], None]
+
+#: Why a batch was kept. Codes, not prose: the caller that shows them to a person
+#: has to translate them, and a log line cannot be translated.
+SKIP_OUTSIDE_ROOT = "outside_trash_root"
+SKIP_UNREADABLE = "unreadable_batch"
+SKIP_UNLISTED_FILES = "unlisted_files"
+#: The delete ran but the batch is still on disk, so it is still on the user's screen.
+SKIP_INCOMPLETE = "incomplete"
+
+# How many deleted files pass between two progress callbacks. Per file would be six
+# figures of calls for one batch of the size this reporting exists for.
+_PROGRESS_EVERY_FILES = 500
+
+
+def _manifest_rels(batch: Path) -> list[str]:
+    """Every staged file the batch's manifest names, as batch-relative paths."""
+    parsed = _read_manifest(batch)
+    if parsed is None:
+        return []
+    rels: list[str] = []
+    for entry in parsed[1]:
+        files = entry.get("files")
+        if not isinstance(files, list):
+            continue
+        for record in files:
+            if isinstance(record, dict) and isinstance(record.get("rel"), str):
+                rels.append(record["rel"])
+    return rels
+
+
+#: True when this platform can delete a file by (directory fd, name) and can open a
+#: directory refusing to follow a link. Both are what make a per-file delete safe;
+#: Windows has neither, so it takes the coarse path below.
+_FD_SAFE_DELETE = (
+    {os.open, os.unlink, os.stat} <= os.supports_dir_fd
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+_DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_chain(batch_fd: int, parts: tuple[str, ...], cache: dict[tuple[str, ...], int]) -> int:
+    """Open the directory named by *parts*, one component at a time, or raise.
+
+    Every component is opened with ``O_NOFOLLOW`` relative to the previous one, so a
+    component that is (or becomes) a link fails the open instead of being followed.
+    Descriptors are cached because one batch has a handful of directories and tens of
+    thousands of files in them.
+    """
+    fd = batch_fd
+    key: tuple[str, ...] = ()
+    for part in parts:
+        key = key + (part,)
+        cached = cache.get(key)
+        if cached is None:
+            cached = os.open(part, _DIR_OPEN_FLAGS, dir_fd=fd)
+            cache[key] = cached
+        fd = cached
+    return fd
+
+
+def _plain_parts(rel: str) -> tuple[str, ...] | None:
+    """The components of *rel*, or None if it is not a plain path under a batch.
+
+    A manifest is a file on disk: a tampered or corrupted one can name an absolute
+    path or walk out with ``..``. Every consumer of a manifest entry goes through
+    here first, so "is this name usable" is answered in ONE place rather than at each
+    call site - the size read below skipped this check when it was written inline in
+    the delete, and stat'd whatever the manifest said.
+
+    Absoluteness is asked of the PATH rather than of any spelling of a separator.
+    Enumerating those was the earlier bug: ``PurePosixPath("//tmp/victim").parts`` is
+    ``("//", "tmp", "victim")`` - a POSIX root of two slashes, which a check against
+    ``"/"`` misses - and an absolute path passed to ``os.open`` ignores ``dir_fd``
+    entirely, so the open leaves the batch. Both flavours are consulted because the
+    coarse path joins these names with the local ``Path``: on Windows ``..\\x`` is a
+    parent reference and ``C:\\x`` is absolute, neither of which POSIX parsing sees.
+
+    A DRIVE is rejected whether or not the path is absolute, which is not the same
+    question. ``C:.ssh/id_rsa`` is drive-RELATIVE - ``is_absolute()`` is False - yet
+    joining it onto the batch on Windows replaces the anchor, because pathlib lets a
+    right-hand side that carries a drive take over, and it then resolves against that
+    drive's working directory. So the size read would stat a path outside the batch and
+    report its existence and size. Asking for ``.drive`` covers every spelling of that,
+    including ``c:y``, which a check for a component ending in a colon does not see.
+
+    That also refuses a POSIX file legitimately named ``a:b``, since Windows parsing
+    reads the same two characters as a drive. Accepted deliberately: this store names
+    its own files, so nothing it writes looks like that, and the cost of being wrong is
+    one batch reported incomplete and kept rather than a path escaping the batch.
+    """
+    if PurePosixPath(rel).is_absolute() or PureWindowsPath(rel).is_absolute():
+        logger.warning("refusing a staged path that is absolute")
+        return None
+    if PureWindowsPath(rel).drive:
+        logger.warning("refusing a staged path that names a drive")
+        return None
+    parts = PurePosixPath(rel).parts
+    if not parts or any(part in ("", ".", "..") or "\\" in part for part in parts):
+        logger.warning("refusing a staged path that is not a plain name")
+        return None
+    return parts
+
+
+def _listed_bytes(batch: Path, rels: list[str]) -> int:
+    """Best-effort size of the manifest's files plus the manifest itself.
+
+    Statting the named files rather than walking the tree, for the same reason the
+    delete does not walk it - and only names that pass :func:`_plain_parts`, so a
+    tampered entry cannot make this measure a file outside the batch.
     """
     total = 0
-    stack = [root]
-    while stack:
-        current = stack.pop()
+    for rel in rels:
+        parts = _plain_parts(rel)
+        if parts is None:
+            continue
         try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-                        elif entry.is_file(follow_symlinks=False):
-                            total += entry.stat(follow_symlinks=False).st_size
-                    except OSError:
-                        continue
+            total += batch.joinpath(*parts).lstat().st_size
         except OSError:
             continue
+    try:
+        total += (batch / MANIFEST_NAME).lstat().st_size
+    except OSError:
+        pass
     return total
 
 
-def empty_trash(batch_ids: list[str] | None = None) -> int:
+def _open_absolute_nofollow(path: Path) -> tuple[int, int]:
+    """Open *path* and its parent, walking from the filesystem root.
+
+    Returns ``(parent fd, path fd)``. The parent is returned because removing the
+    directory itself must also happen by descriptor: ``rmtree`` and ``rmdir`` take a
+    PATH, which re-resolves the whole prefix, so the last step of the delete would
+    reopen the batch through exactly the ancestors this walk exists to pin.
+
+    ``O_NOFOLLOW`` constrains only the LAST component, so opening the batch by its
+    path left every ancestor to be re-resolved by the kernel: the trash root and the
+    directories above it are writable by the same user, and one swapped to a link
+    after validation was followed - after which the descriptors returned here, and
+    every unlink through them, point outside the trash. Walking component by component
+    applies the refusal at every level, so nothing above the batch can be substituted
+    between the check and the open.
+
+    *path* must already be RESOLVED, which is what makes demanding this safe rather
+    than brittle: a resolved path contains no links, so ``O_NOFOLLOW`` can only fail
+    because something changed underneath - the case worth failing on - and not on an
+    install whose data home legitimately sits behind a symlinked home directory, which
+    a naive "no links anywhere" rule would refuse outright.
+    """
+    parts = path.parts
+    if len(parts) < 2:
+        raise OSError(f"refusing to open {path}: it has no parent")
+    # parts[0] is the anchor ("/"), which cannot be a link.
+    fd = os.open(parts[0], _DIR_OPEN_FLAGS)
+    parent = -1
+    try:
+        for part in parts[1:]:
+            nxt = os.open(part, _DIR_OPEN_FLAGS, dir_fd=fd)
+            if parent >= 0:
+                os.close(parent)
+            parent, fd = fd, nxt
+    except OSError:
+        os.close(fd)
+        if parent >= 0:
+            os.close(parent)
+        raise
+    return parent, fd
+
+
+def _clear_by_descriptor(dir_fd: int, keep: str | None = None) -> bool:
+    """Remove every directory under *dir_fd*, bottom-up and by descriptor.
+
+    Returns True when nothing is left. Entries are enumerated through the descriptor
+    (``os.scandir`` accepts one) and children are opened relative to it with
+    ``O_NOFOLLOW``, so no path is ever resolved and a directory that is really a link
+    is not descended into.
+
+    ``keep`` names one entry in the TOP directory to leave in place without counting
+    it as a leftover - the batch manifest, which the caller removes only after this
+    returns True. Without that exception the manifest would either be deleted early
+    (leaving unrestorable data if a listed file survived) or make every batch report
+    itself as not cleared.
+
+    A leftover REGULAR file is deliberately left alone and reported as "not cleared"
+    rather than unlinked. Callers reach here only after :func:`_unlisted_files` has
+    confirmed the batch holds nothing the manifest omits, so anything else appearing at
+    this point is unaccounted-for data and the whole point of that guard is that this
+    module does not destroy it.
+
+    A LINK is removed, because removing a link destroys nothing - the thing it points
+    at is untouched, and this module never follows one. Leaving links would make a
+    batch holding one impossible to empty for good, which is a worse outcome than
+    removing a pointer: the earlier guard admits a link to a DIRECTORY (``is_file()``
+    follows links, so it reads as neither a file nor unaccounted data), and that batch
+    would otherwise be stuck on the user's screen forever.
+    """
+    cleared = True
+    try:
+        with os.scandir(dir_fd) as entries:
+            listing = list(entries)
+    except OSError:
+        return False
+    for entry in listing:
+        if keep is not None and entry.name == keep:
+            continue
+        try:
+            is_link = entry.is_symlink()
+            is_dir = entry.is_dir(follow_symlinks=False)
+        except OSError:
+            cleared = False
+            continue
+        if is_link:
+            try:
+                os.unlink(entry.name, dir_fd=dir_fd)
+            except OSError:
+                cleared = False
+            continue
+        if not is_dir:
+            cleared = False
+            continue
+        try:
+            child = os.open(entry.name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+        except OSError:
+            cleared = False
+            continue
+        try:
+            if not _clear_by_descriptor(child):
+                cleared = False
+        finally:
+            os.close(child)
+        try:
+            os.rmdir(entry.name, dir_fd=dir_fd)
+        except OSError:
+            cleared = False
+    return cleared
+
+
+def _delete_listed_files(
+    batch: Path,
+    on_progress: EmptyProgress | None,
+    base_bytes: int,
+) -> tuple[int, str | None]:
+    """Delete the files the manifest names, reporting bytes freed as it goes.
+
+    Returns ``(bytes freed, skip code or None)``. A skip code means the batch is still
+    there and the caller must say so: reporting bytes alone left a batch that survived
+    looking exactly like an empty one - "0 bytes freed, success" - which is the silent
+    refusal this module's skip codes exist to remove. The two ways that happens are the
+    batch not opening at all, and the tree not being gone afterwards.
+
+    Driven by the MANIFEST, not by a directory walk, and that is a safety property
+    rather than a convenience. A walk has to decide per directory entry whether to
+    descend, and on Windows a junction is not a symlink — ``os.path.islink`` reports
+    False for one, so ``os.walk`` descends into it and would unlink the files it
+    points at, outside the trash entirely. Naming the files means nothing is ever
+    discovered by traversal.
+
+    Each file is then removed by ``(directory fd, name)``, with every directory
+    component opened ``O_NOFOLLOW`` from the batch down. That is what makes the
+    per-file delete safe rather than merely validated: checking a path and then
+    unlinking it re-resolves the prefix, so a component swapped to a link in between
+    would be followed and the same-named file outside the trash deleted. Nothing here
+    resolves a path at unlink time, so there is no window to win.
+
+    Removing the emptied directories is by descriptor too, bottom-up, so no step of
+    this path ever resolves a path - not even the last one. Finishing with
+    ``rmtree(batch)`` re-resolved the whole prefix, which reopened the batch through
+    exactly the ancestors the walk above exists to pin. Callers reach here only after :func:`_unlisted_files` has confirmed the
+    batch holds nothing the manifest omits, so "every listed file" is every file.
+
+    Per-file rather than per-batch because that is the whole point: the store this
+    exists for stages a single batch holding tens of thousands of sessions, where
+    "one batch done" is one step from nothing to finished, minutes later. Where the
+    platform cannot delete by descriptor the coarse path is taken instead — a
+    smoother progress bar is not worth a weaker delete.
+
+    ``base_bytes`` is what earlier batches in the same call already freed, so the
+    number handed to ``on_progress`` is always the total for the whole operation and
+    never a figure that restarts per batch.
+    """
+    rels = _manifest_rels(batch)
+    if not _FD_SAFE_DELETE:
+        before = _listed_bytes(batch, rels)
+        shutil.rmtree(batch, ignore_errors=True)
+        # Measured again, not assumed: `ignore_errors` means a locked file - the normal
+        # Windows failure - leaves the batch standing while rmtree returns quietly. The
+        # up-front figure would then be reported as freed with the bytes still on disk,
+        # which is the same "told something that is not true about an irreversible
+        # operation" this screen exists to fix. What survived is subtracted instead.
+        freed = before - _listed_bytes(batch, rels)
+        if on_progress is not None:
+            on_progress(base_bytes + freed)
+        return freed, _incomplete_if_present(batch)
+
+    freed = 0
+    files = 0
+    cache: dict[tuple[str, ...], int] = {}
+    try:
+        parent_fd, batch_fd = _open_absolute_nofollow(batch)
+    except OSError as exc:
+        logger.warning("refusing to empty %s: %s", batch.name, exc)
+        return 0, SKIP_UNREADABLE
+    cleared = False
+    try:
+        for rel in rels:
+            # No absolute path, no traversal, no empty component: a tampered manifest
+            # does not get to name anything but a plain path under this batch.
+            parts = _plain_parts(rel)
+            if parts is None:
+                continue
+            # Nor does it get to name the MANIFEST, which is the batch's own recovery
+            # metadata: `list_trash()` omits a batch without a readable one, so
+            # removing it here - before the sweep has proved every other file gone -
+            # turns any surviving session data into files the user can neither see nor
+            # restore. The manifest is removed once, at the end, by the caller below.
+            if parts == (MANIFEST_NAME,):
+                logger.warning("refusing a staged entry that names the manifest")
+                continue
+            try:
+                parent_of_file = _open_chain(batch_fd, parts[:-1], cache)
+                info = os.stat(parts[-1], dir_fd=parent_of_file, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                continue
+            try:
+                os.unlink(parts[-1], dir_fd=parent_of_file)
+            except OSError:
+                continue
+            freed += info.st_size
+            files += 1
+            # Reporting per file would call back six figures of times for one batch;
+            # this is often enough that a reader sees the number move.
+            if on_progress is not None and files % _PROGRESS_EVERY_FILES == 0:
+                on_progress(base_bytes + freed)
+        # The manifest is not one of its own entries, and on a batch of this size it
+        # is not a rounding error, so its size is counted here - but it is NOT removed
+        # yet. It is the only thing that makes the batch restorable: `list_trash()`
+        # omits a batch with no readable manifest, so deleting it while a listed file
+        # still survived (an unwritable staged directory, a file held open) left the
+        # user with data on disk they could neither see nor restore. It goes last,
+        # only once the sweep has confirmed nothing else is left.
+        manifest_bytes = 0
+        try:
+            manifest_bytes = os.stat(MANIFEST_NAME, dir_fd=batch_fd, follow_symlinks=False).st_size
+        except OSError:
+            pass
+        # Descriptors held for the walk are closed before the sweep, so the sweep's
+        # own rmdir calls are not defeated by an open handle on Windows-like systems
+        # and so it enumerates a directory nothing else is holding.
+        for opened in cache.values():
+            os.close(opened)
+        cache.clear()
+        # `keep` is the manifest: the sweep must not treat it as an unaccounted
+        # leftover, and must still report whether anything ELSE remains.
+        cleared = _clear_by_descriptor(batch_fd, keep=MANIFEST_NAME)
+        if cleared:
+            try:
+                os.unlink(MANIFEST_NAME, dir_fd=batch_fd)
+                freed += manifest_bytes
+            except OSError:
+                cleared = False
+    finally:
+        for opened in cache.values():
+            os.close(opened)
+        os.close(batch_fd)
+    if cleared:
+        # The last step, also by descriptor. `rmtree`/`rmdir` on a PATH re-resolves the
+        # whole prefix, so finishing that way would reopen the batch through exactly
+        # the ancestors the walk above exists to pin - and an ancestor swapped at that
+        # moment sends the removal outside the trash.
+        try:
+            os.rmdir(batch.name, dir_fd=parent_fd)
+        except OSError as exc:
+            logger.warning("emptying %s did not remove it: %s", batch.name, exc)
+            cleared = False
+    os.close(parent_fd)
+    if on_progress is not None:
+        on_progress(base_bytes + freed)
+    return freed, None if cleared else SKIP_INCOMPLETE
+
+
+def _incomplete_if_present(batch: Path) -> str | None:
+    """``SKIP_INCOMPLETE`` if the batch survived its own delete, else None.
+
+    Used by the COARSE path only. The descriptor path knows whether it cleared the
+    tree from its own return values and needs no second look; this one calls
+    ``rmtree(ignore_errors=True)``, which reports nothing, so a tree it could not
+    remove - a file held open by another process, a permission it does not have - left
+    the batch on screen while the job said it had succeeded. Whether the directory is
+    actually gone is the one question that distinguishes those, and it costs a stat.
+    """
+    try:
+        if batch.exists():
+            logger.warning("emptying %s did not remove it", batch.name)
+            return SKIP_INCOMPLETE
+    except OSError:
+        return SKIP_INCOMPLETE
+    return None
+
+
+def staged_targets(batch_ids: list[str] | None = None) -> tuple[list[str], int]:
+    """Which staged batches an empty would destroy, and what they hold.
+
+    Taken under the mutation lock, which is the whole point of it being here rather
+    than a list comprehension at the caller. ``move_to_trash`` holds that lock for
+    the length of a staging run, and :func:`list_trash` does not take it - so an
+    unlocked read can see a batch whose directory and manifest header exist while its
+    sessions are still being moved in. Selecting that id then makes the delete wait
+    for staging to finish and destroy the FINISHED batch, including sessions appended
+    after the user clicked. Under the lock a batch is either fully staged or not
+    visible, so the set returned is one a user could actually have seen.
+
+    Returns explicit ids even for "everything", because the caller must be able to
+    hand the worker a fixed set: ``empty_trash(None)`` re-enumerates when it runs,
+    which is later, and a staged batch is the only copy of its sessions.
+    """
+    with _mutation_lock():
+        # Explicit ids go through the SAME resolver every other caller uses, before
+        # anything is filtered. Filtering alone silently dropped an id that is not a
+        # batch - a typo, or one already emptied - so the worker received an empty
+        # list and reported success for a delete the user asked for and did not get.
+        # This keeps the guard `empty_trash` has always applied through `_batch_dir`,
+        # which the filter had quietly taken over from.
+        for batch_id in batch_ids or []:
+            _batch_dir(batch_id)
+        wanted = None if batch_ids is None else set(batch_ids)
+        chosen = [batch for batch in list_trash() if wanted is None or batch.batch_id in wanted]
+        if wanted is not None:
+            # A well-formed id whose batch is not staged - already emptied, or never
+            # existed - passes `_batch_dir`, which does not require the directory to
+            # exist. Filtering it out silently turned "destroy this" into a zero-byte
+            # success. It is a refusal: the caller named something that is not there,
+            # and on the pre-snapshot path the batch would at least have reported an
+            # unreadable-batch skip once it reached the delete.
+            missing = wanted - {batch.batch_id for batch in chosen}
+            if missing:
+                raise SessionStorageError(
+                    f"{len(missing)} of the batches named are no longer staged"
+                )
+        return [batch.batch_id for batch in chosen], sum(batch.bytes for batch in chosen)
+
+
+def empty_trash(
+    batch_ids: list[str] | None = None,
+    on_progress: EmptyProgress | None = None,
+    on_skip: EmptySkip | None = None,
+) -> int:
     """Delete staged batches for good; return the bytes freed.
 
     Serialized against other mutations, so a batch cannot be destroyed while a
     restore is mid-way through putting its files back.
+
+    ``on_progress`` is called with the running total of bytes freed and ``on_skip``
+    with a ``SKIP_*`` code for each batch kept rather than deleted, both from the
+    calling thread. They are advisory: a caller that passes neither gets exactly the
+    behaviour it always had, and nothing here waits on or trusts a callback.
+
+    ``on_skip`` exists because keeping a batch is a REFUSAL a person needs told.
+    Returning only the bytes freed made a batch that was deliberately kept
+    indistinguishable from an empty one — "0 bytes freed, success" — with the reason
+    reaching a log the user cannot read.
     """
     with _mutation_lock():
         try:
-            return _empty_trash_locked(batch_ids)
+            return _empty_trash_locked(batch_ids, on_progress, on_skip)
         finally:
             invalidate_scan_cache()
 
 
-def _empty_trash_locked(batch_ids: list[str] | None = None) -> int:
+def _empty_trash_locked(
+    batch_ids: list[str] | None = None,
+    on_progress: EmptyProgress | None = None,
+    on_skip: EmptySkip | None = None,
+) -> int:
     """Delete staged batches for real; return the bytes freed.
 
     This is the only call here that destroys data, and the only one that changes
@@ -1781,6 +2218,11 @@ def _empty_trash_locked(batch_ids: list[str] | None = None) -> int:
     first, so a tampered manifest or a symlinked batch directory cannot direct the
     delete outside it.
     """
+
+    def _skipped(code: str) -> None:
+        if on_skip is not None:
+            on_skip(code)
+
     try:
         root = trash_root().resolve()
     except OSError:
@@ -1798,6 +2240,7 @@ def _empty_trash_locked(batch_ids: list[str] | None = None) -> int:
             continue
         if resolved == root or not resolved.is_relative_to(root):
             logger.warning("refusing to empty %s: outside the trash root", target)
+            _skipped(SKIP_OUTSIDE_ROOT)
             continue
         # A batch can hold files no manifest line mentions, left by an interruption
         # between the move and the append. The user was never shown them — the
@@ -1809,6 +2252,7 @@ def _empty_trash_locked(batch_ids: list[str] | None = None) -> int:
             # Skip, not abort: one unreadable batch must not make the whole trash
             # un-emptyable. Skipping deletes nothing, which is the safe direction.
             logger.warning("refusing to empty %s: %s", target.name, exc)
+            _skipped(SKIP_UNREADABLE)
             continue
         if leftovers:
             logger.warning(
@@ -1817,7 +2261,10 @@ def _empty_trash_locked(batch_ids: list[str] | None = None) -> int:
                 target.name,
                 len(leftovers),
             )
+            _skipped(SKIP_UNLISTED_FILES)
             continue
-        freed += _dir_bytes(resolved)
-        shutil.rmtree(resolved, ignore_errors=True)
+        deleted, skip = _delete_listed_files(resolved, on_progress, freed)
+        freed += deleted
+        if skip is not None:
+            _skipped(skip)
     return freed
