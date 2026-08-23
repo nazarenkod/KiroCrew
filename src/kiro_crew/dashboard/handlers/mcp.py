@@ -26,6 +26,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.env import emit_env
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.mcp_discovery import (
     managed_server_is_session_bound,
     probe_metadata,
@@ -2197,7 +2198,7 @@ async def api_mcp_gateway_metrics(request: web.Request) -> web.Response:
 # so two concurrent dashboard requests cannot interleave broker start/stop and
 # orphan a gatewayd process. The config write is guarded by _get_config_lock();
 # this lock guards the apply() side effect that runs AFTER that lock is released.
-_MCP_GATEWAY_APPLY_LOCK = asyncio.Lock()
+_MCP_GATEWAY_APPLY_LOCK = LoopBoundLock()
 
 
 def _local_overlay_section() -> dict:
@@ -2289,7 +2290,7 @@ def _freeze_stub_servers(section: dict, overlay: dict | None = None) -> None:
 #: slow, so two overlapping presses would double the network work and race each
 #: other's atomic commits. Deliberately NOT the gateway apply lock: a refresh
 #: must not block an operator toggling sharing while it runs.
-_MCP_RESOLVE_REFRESH_LOCK = asyncio.Lock()
+_MCP_RESOLVE_REFRESH_LOCK = LoopBoundLock()
 
 
 async def api_mcp_resolve_refresh(request: web.Request) -> web.Response:
