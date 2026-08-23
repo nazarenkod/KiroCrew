@@ -3881,7 +3881,9 @@
         "co_author": "Coautor",
         "co_author_conflict": "O coautor alterou este arquivo",
         "co_author_conflict_discard": "Descartar as minhas edições e recarregar",
+        "co_author_conflict_discard_button": "Descartar edições",
         "co_author_conflict_discard_confirm": "Descartar as tuas edições não guardadas em “{{file}}” e carregar a versão do coautor? Não é possível anular esta ação.",
+        "co_author_conflict_discard_title": "Descartar edições não guardadas?",
         "commit_and_push": "Confirmar e enviar",
         "commit_message_prompt": "Descreve esta confirmação. Inclui todas as alterações do artigo.",
         "compile": "Compilar",
@@ -5657,6 +5659,7 @@
       "collapse_unchanged": "Recolher inalteradas",
       "copy_content": "Copiar conteúdo",
       "copy_path": "Copiar caminho",
+      "discard_changes_button": "Descartar alterações",
       "discard_unsaved_changes": "Descartar alterações não salvas?",
       "download": "Baixar",
       "download_failed": "Falha ao baixar",
@@ -6908,6 +6911,9 @@
       "billing_notice": "Este e um servico pago da AWS. Ate voce confirmar, nenhuma solicitacao e enviada.",
       "confirm_button": "Confirmar e ativar",
       "withdraw": "Retirar a confirmacao"
+    },
+    "confirmDialog": {
+      "cancel": "Cancelar"
     }
   },
   "hooks": {
@@ -7491,7 +7497,13 @@
       "public_by_link_warning": "As URLs publicadas são públicas por link: qualquer pessoa com o link pode ver o conteúdo — ele é servido na internet pública sem autenticação.",
       "random_domain_note": "O conteúdo é servido em um domínio *.cloudfront.net aleatório — não publique nada que você não colocaria na internet aberta.",
       "cloud_deployment_disabled": "Cloud deployment is disabled",
-      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake."
+      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake.",
+      "recall_title": "Recolher o site?",
+      "recall_button": "Recolher o site",
+      "destroy_title": "Destruir o site?",
+      "destroy_button": "Destruir o site",
+      "remove_profile_title": "Remover o perfil?",
+      "remove_profile_button": "Remover o perfil"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· uma versão mais recente está disponível na cópia remota",
@@ -7523,6 +7535,7 @@
       "copy_failed": "Falha ao copiar",
       "could_not_overwrite": "Não foi possível sobrescrever.",
       "created": "Criado",
+      "discard_changes_button": "Descartar alterações",
       "discard_unsaved_changes": "Descartar alterações não salvas?",
       "document_type": "Tipo de documento",
       "download": "Baixar",
