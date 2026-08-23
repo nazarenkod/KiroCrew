@@ -14,9 +14,12 @@ degrades to a numbered text list the user can answer by typing. The cap is
 ENFORCED (see ``test/test_capability_ledger.py``) and pinned per channel by
 the cross-channel contract test in ``test/test_options_cap_contract.py`` —
 a widget-capable renderer that skips the helper fails that test.
-Channels declaring ``max_buttons=0`` render no widget and today strip the
-trailer entirely; the numbered-text fallback for them lands with the
-approval-ladder work.
+Channels declaring ``max_buttons=0`` render no widget. They parse the trailer
+with :func:`split_options_trailer` and then choose: some route the choices through
+:func:`append_options_text`, which numbers them into the message body so they stay
+answerable by typing, while Teams, iMessage, WeCom and Weixin still discard them.
+Webex declares a widget (Adaptive Card actions) AND always ships the numbered
+text, because the inbound half of a press rides an undocumented websocket.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from kiro_crew.constants import OPTIONS_RE_TRAILER
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
@@ -86,6 +90,29 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     if max_chars <= 0 or len(text) <= max_chars:
         return [text]
     return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
+
+
+def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[str]:
+    """Split *text* into parts the transport will accept, in ITS unit.
+
+    Prefers ``max_message_bytes`` when the platform declares one, because a
+    character count cannot express a byte cap without being wrong in one
+    direction or the other: the only safe char value is the byte budget over four
+    (the worst case for a 4-byte code point), which cuts an ASCII reply into
+    quarters, while the true char cap would let a CJK reply exceed the byte limit
+    and be truncated on send.
+
+    The byte path is also fence-aware (:func:`~kiro_crew.messaging.split.split_markdown_bytes`),
+    so a code block spanning a boundary survives; the char path keeps the blind
+    ``chunk_text`` behaviour every existing caller already relies on.
+    """
+    if capabilities.max_message_bytes > 0:
+        # Local import: split.py is a heavier pure-Python module and this is the
+        # only path that needs it, so the renderer contract stays cheap to import.
+        from kiro_crew.messaging.split import split_markdown_bytes
+
+        return split_markdown_bytes(text, capabilities.max_message_bytes)
+    return chunk_text(text, capabilities.max_message_chars)
 
 
 def cap_choices(
@@ -185,22 +212,82 @@ def apply_options_cap(
       the remainder is appended to ``body`` as a numbered text list
       (numbering continues after the widget slots) rather than dropped, so
       the user still learns those choices exist.
-    * ``max_buttons <= 0`` — returns ``(body, [])``; zero-widget channels
-      own their trailer handling (today: strip).
+    * ``max_buttons <= 0`` — returns ``(body, [])``; zero-widget channels do
+      not call this at all. They parse with :func:`split_options_trailer` and
+      then either number the choices via :func:`append_options_text` or discard
+      them.
     """
     if capabilities.max_buttons <= 0:
         return body, []
     kept, overflow = cap_choices(choices, capabilities)
     if not overflow:
         return body, kept
-    lines = format_overflow(overflow, start=len(kept))
+    return _join_body(body, format_overflow(overflow, start=len(kept))), kept
+
+
+def _join_body(body: str, lines: str) -> str:
+    """Append a numbered block to *body* with a blank line between them.
+
+    A single trailing newline is treated as mid-paragraph, so the block still
+    gets the paragraph break every markdown dialect needs to start a list.
+    """
     if not body:
-        sep = ""
-    elif body.endswith("\n"):
-        sep = "\n"
-    else:
-        sep = "\n\n"
-    return f"{body}{sep}{lines}", kept
+        return lines
+    sep = "\n" if body.endswith("\n") else "\n\n"
+    return f"{body}{sep}{lines}"
+
+
+def split_options_trailer(text: str) -> tuple[str, list[str]]:
+    """Split a trailing ``[OPTIONS: a | b | c]`` protocol trailer off *text*.
+
+    Returns ``(body, choices)``. The counterpart of :func:`append_options_text`
+    and :func:`apply_options_cap`: every renderer that presents choices has to
+    parse them out first, and this is the one place that decides what counts as
+    a trailer.
+
+    Shared because the SECOND branch is a security rule, not a convenience. A
+    trailer still streaming in — ``[OPTIONS: yes | n`` with no closing bracket —
+    is truncated protocol whose choices are not yet knowable, so it is HIDDEN
+    rather than rendered. A channel that reimplements the parse and forgets that
+    branch leaks reserved protocol into the conversation as raw text.
+
+    The regex itself lives in ``constants.OPTIONS_RE_TRAILER`` (ReDoS-hardened,
+    anchored at end of text). Callers that only want the body discard the second
+    element.
+    """
+    m = OPTIONS_RE_TRAILER.search(text)
+    if m:
+        choices = [c.strip() for c in m.group(1).split("|")]
+        return text[: m.start()].rstrip(), [c for c in choices if c]
+    idx = text.rfind("[OPTIONS")
+    if idx != -1 and "]" not in text[idx:]:
+        return text[:idx].rstrip(), []
+    return text, []
+
+
+def append_options_text(body: str, choices: list[str]) -> str:
+    """Render ``[OPTIONS:]`` *choices* as a numbered list appended to *body*.
+
+    The ``max_buttons=0`` counterpart of :func:`apply_options_cap`. A channel
+    with no interactive widget would otherwise DELETE the trailer, and the user
+    never learns the choices existed — they see a question with no answers.
+    Numbered text is answerable everywhere, because typing a reply is a plain
+    message on every channel.
+
+    Shared rather than per-channel for the same reason the cap is: this is the
+    sink where :func:`format_overflow`'s two sanitisations have to happen —
+    display-form credential redaction FIRST, then mention defanging — and a
+    channel cannot forget what it does not implement itself.
+
+    Deliberately separate from :func:`apply_options_cap` rather than widening
+    its ``max_buttons <= 0`` branch: that branch's "keep nothing, leave the body
+    alone" contract is pinned by ``test/test_options_cap_contract.py``, and the
+    widget-capable callers rely on it. Empty *choices* returns *body*
+    unchanged so a caller need not special-case an absent trailer.
+    """
+    if not choices:
+        return body
+    return _join_body(body, format_overflow(choices, start=0))
 
 
 class Renderer(ABC):

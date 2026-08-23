@@ -181,7 +181,7 @@ from kiro_crew.mcp_discovery import kirocrew_managed_names
 from kiro_crew.members import record_activity
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
-from kiro_crew.messaging.renderer import chunk_text
+from kiro_crew.messaging.renderer import chunk_for_transport
 from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
@@ -2754,7 +2754,7 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     # Split on the channel's max message length so a long reply mirrors in full
     # rather than being hard-truncated by the transport (Telegram caps at 4096),
     # matching the Slack leg's split_message chunking.
-    parts = chunk_text(text, transport.capabilities.max_message_chars)
+    parts = chunk_for_transport(text, transport.capabilities)
     try:
         for part in parts:
             await transport.send_message(link.channel_id, part, thread_id=link.thread_id)

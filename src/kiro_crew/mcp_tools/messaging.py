@@ -50,10 +50,30 @@ def schemas() -> list[dict[str, Any]]:
                 " this cron. Falls through to notification-only if origin is"
                 " unreachable (tab closed, history deleted, or cron has no origin)."
                 "\n\nExplicit channel=... or user=... always sends to Slack."
+                "\n\nTo reach a NON-Slack channel (Webex, Telegram, Discord, …),"
+                " pass channel_type plus target_id, where target_id is one of the"
+                " opaque ids that channel exposes as a configured destination."
+                " The channel's own allow-list is re-checked when the message is"
+                " sent, so an id that is no longer configured is refused."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "channel_type": {
+                        "type": "string",
+                        "description": (
+                            "Non-Slack channel to deliver to (e.g. 'webex'). Requires "
+                            "target_id. The channel must be connected and able to "
+                            "start a conversation."
+                        ),
+                    },
+                    "target_id": {
+                        "type": "string",
+                        "description": (
+                            "Opaque configured-destination id for channel_type "
+                            "(e.g. 'user:someone@example.com'). Requires channel_type."
+                        ),
+                    },
                     "text": {
                         "type": "string",
                         "description": "Message text. Also used as fallback when blocks are provided.",
@@ -261,6 +281,10 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     payload = {"text": text, "title": title}
     if args.get("blocks"):
         payload["blocks"] = args["blocks"]
+    if args.get("channel_type"):
+        payload["channel_type"] = args["channel_type"]
+    if args.get("target_id"):
+        payload["target_id"] = args["target_id"]
     if args.get("channel"):
         payload["channel"] = args["channel"]
     if args.get("user"):
@@ -309,16 +333,27 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     # channel=/user=-addressed send reach Slack while bypassing the gate. A
     # bare send (no session/channel/user, non-cron) is the in-process
     # dashboard notification path, governed by the messaging gate above.
-    slack_bound = (
-        payload.get("session") == "slack"
-        or bool(payload.get("channel"))
-        or bool(payload.get("user"))
-        or is_cron
-    )
-    if slack_bound:
-        _gov_chan = mcp_core._vet_channel_governance(caller_session, "slack")
+    # A channel-addressed send is vetted against the transport it NAMES, because
+    # the ``channels`` scope is per-transport: vetting the literal "slack" for a
+    # Webex send would check a policy that has nothing to do with the surface the
+    # message actually reaches. The gateway re-vets at its own egress chokepoint;
+    # this is the earlier of the two, so a denied send never opens a remote DM.
+    addressed = str(payload.get("channel_type") or "")
+    if addressed:
+        _gov_chan = mcp_core._vet_channel_governance(caller_session, addressed)
         if _gov_chan:
             return f"Error: {_gov_chan}"
+    else:
+        slack_bound = (
+            payload.get("session") == "slack"
+            or bool(payload.get("channel"))
+            or bool(payload.get("user"))
+            or is_cron
+        )
+        if slack_bound:
+            _gov_chan = mcp_core._vet_channel_governance(caller_session, "slack")
+            if _gov_chan:
+                return f"Error: {_gov_chan}"
     resp = mcp_core._post("/api/send-message", payload)
     if not resp.get("ok"):
         return f"Failed: {resp}"

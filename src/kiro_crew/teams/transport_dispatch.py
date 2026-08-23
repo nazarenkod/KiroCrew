@@ -35,6 +35,7 @@ from kiro_crew.messaging.dispatch import (
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
+from kiro_crew.safety_override import safety_override
 from kiro_crew.teams.commands import HELP_TEXT, ConversationState, parse_command
 from kiro_crew.teams.renderer import TeamsRenderer
 from kiro_crew.teams.transport import TEAMS_CAPABILITIES
@@ -175,6 +176,9 @@ class TeamsDispatcher:
                 renderer=renderer,
                 approval_mode=self.approval_mode,
                 decider=None,  # Teams can't render approve/deny buttons (MVP)
+                # Read per request, not captured here, so a grant taken or
+                # revoked mid-turn takes effect on the next tool.
+                auto_approve_session=lambda: safety_override().is_active(),
                 persist=lambda user_text, reply, is_new: self._persist_turn(
                     session_key, user_text, reply, is_new, agent
                 ),

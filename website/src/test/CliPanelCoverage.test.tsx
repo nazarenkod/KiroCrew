@@ -552,11 +552,23 @@ describe('CliPanel theme and font sync', () => {
     // sees here is the <head> insertion (a custom theme's vars arrive that way,
     // with no data-theme change to notice).
     await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    // The var is set INLINE and the style element carries only the id the
+    // observer filters on. Putting the value in the element's own rule made this
+    // fail on loaded CI runners: the app's theme bootstrap replaces <head>'s
+    // style elements when it applies a theme, so the probe's rule could be gone
+    // before the repaint read it — `--accent` then resolved empty and the
+    // terminal kept CliPanel's built-in fallback. An inline property on
+    // documentElement outranks every stylesheet and nothing else rewrites it,
+    // which is why the sibling attribute test above has always been stable.
+    document.documentElement.style.setProperty('--accent', '#ff8800')
     const style = document.createElement('style')
     style.id = 'mc-custom-theme-probe'
-    style.textContent = ':root { --accent: #ff8800; }'
-    act(() => { document.head.appendChild(style) })
-    await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
+    try {
+      act(() => { document.head.appendChild(style) })
+      await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
+    } finally {
+      document.documentElement.style.removeProperty('--accent')
+    }
   })
 
   it('still repaints after a frame handle whose callback never fires', async () => {
@@ -576,14 +588,19 @@ describe('CliPanel theme and font sync', () => {
     act(() => { document.documentElement.setAttribute('data-theme', 'probe') })
     await act(async () => { await new Promise(r => setTimeout(r, 0)) })
 
-    // Frames work again, and a real theme signal arrives.
+    // Frames work again, and a real theme signal arrives. The var is inline for
+    // the same reason as the test above: a <head> rewrite must not be able to
+    // take the probe's value with it.
     vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 0 })
+    document.documentElement.style.setProperty('--accent', '#ff8800')
     const style = document.createElement('style')
     style.id = 'mc-custom-theme-probe'
-    style.textContent = ':root { --accent: #ff8800; }'
-    act(() => { document.head.appendChild(style) })
-
-    await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
+    try {
+      act(() => { document.head.appendChild(style) })
+      await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
+    } finally {
+      document.documentElement.style.removeProperty('--accent')
+    }
   })
 
   it('ignores an unrelated style element added to <head>', async () => {

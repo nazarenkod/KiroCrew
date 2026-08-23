@@ -31,6 +31,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.constants import OPTIONS_RE_TRAILER, split_trailing_protocol_suffix
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
 from kiro_crew.messaging.renderer import Renderer, apply_options_cap
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.telegram.client import TELEGRAM_RICH_MAX_CHARS
@@ -58,7 +59,8 @@ _TYPING_REFRESH_S = 4.0
 _EDIT_THROTTLE_S = 1.0
 
 # Interactive approval wait; deny-by-default when it elapses with no press.
-_APPROVAL_TIMEOUT_S = 300.0
+# Owned by messaging.approval so every channel's window is the same one.
+_APPROVAL_TIMEOUT_S = APPROVAL_TIMEOUT_S
 
 # Fallback placeholder for a turn that failed without a user-safe reason. The
 # retry wording is only correct for transient failures; a permanent failure

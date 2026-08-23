@@ -2139,3 +2139,58 @@ class TestPersistenceIsOffLoopAndOrdered:
             pass
 
         assert order == ["write-start", "write-done"], order
+
+
+def test_a_webex_session_is_nudge_able():
+    """Webex is in both rosters because it now has the two things that matter.
+
+    A fire adapter (``_fire_webex_nudge``) and an authorization branch in
+    ``autonudge_authz``. Listing a channel without both arms a loop that is then
+    denied or deleted on its first cycle while reporting itself healthy — which is
+    exactly why these rosters are narrow.
+    """
+    from kiro_crew.autonudge import binding_key_for, is_channel_key
+
+    key = "webex:kirocrew:direct:kyle@example.com"
+    assert is_channel_key(key)
+    assert binding_key_for(key) == key
+
+
+def test_the_channels_without_a_fire_adapter_stay_excluded():
+    """Deliberately narrow, and pinned so it stays a decision.
+
+    wecom / teams / weixin / imessage have no ``_fire_*_nudge`` and no authz
+    branch, so a loop bound there could never deliver.
+    """
+    from kiro_crew.autonudge import binding_key_for, is_channel_key
+
+    for channel in ("wecom", "teams", "weixin", "imessage"):
+        key = f"{channel}:kirocrew:direct:someone"
+        assert not is_channel_key(key), channel
+        assert binding_key_for(key) is None, channel
+
+
+def test_a_unified_scope_key_is_never_bindable():
+    """``unified:`` collapses several users' DMs into one bucket.
+
+    It counts as a channel key (so the fixed-interval timer applies) but has no
+    single conversation to deliver to, so a loop must not bind there.
+    """
+    from kiro_crew.autonudge import binding_key_for, is_channel_key
+
+    assert is_channel_key("unified:kirocrew")
+    assert binding_key_for("unified:kirocrew") is None
+
+
+def test_every_nudge_able_channel_has_a_fire_adapter():
+    """The roster and the adapters cannot drift apart.
+
+    This is the invariant the first version of this change got wrong: ``webex:``
+    was added to ``binding_key_for`` while ``_fire`` still handled only slack and
+    discord, so an armed Webex loop was DELETED on its first cycle.
+    """
+    from kiro_crew.slack.gateway import GatewayOrchestrator
+
+    for prefix in ("slack:", "discord:", "webex:"):
+        channel = prefix.rstrip(":")
+        assert hasattr(GatewayOrchestrator, f"_fire_{channel}_nudge"), channel

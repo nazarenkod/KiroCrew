@@ -87,7 +87,20 @@ _TERMINAL_BOUND_REASONS = frozenset({"cycle_cap", "runtime_budget", APPROVAL_STA
 # dashboard turn-lifecycle hooks (notify_turn_complete / notify_user_input),
 # so they run on a fixed interval instead of an idle timer: the timer re-arms
 # itself right after every delivered fire.
-_CHANNEL_KEY_PREFIXES = ("slack:", "discord:", "telegram:", "whatsapp:", "unified:")
+#
+# Narrower than ``CHANNEL_SESSION_NAMESPACES`` on purpose: a channel is listed
+# only once it has a FIRE ADAPTER (``_fire_<channel>_nudge`` in slack/gateway)
+# and an authorization branch in ``autonudge_authz``. Without both, a loop
+# there is armed and then either denied or deleted on its first cycle, while
+# reporting itself healthy.
+_CHANNEL_KEY_PREFIXES = (
+    "slack:",
+    "discord:",
+    "telegram:",
+    "webex:",
+    "whatsapp:",
+    "unified:",
+)
 
 
 def is_channel_key(key: str) -> bool:
@@ -101,9 +114,17 @@ def binding_key_for(session_key: str) -> str | None:
     session is not nudge-able.
 
     ``dashboard:chat-N-TS`` → bare slot key ``chat-N-TS`` (the autonudge layer
-    keys dashboard loops on the bare slot key); ``slack:``/``discord:`` session
-    keys pass through unchanged (channel-bound loops). Anything else
-    (``cron:``, ``hook:``, ``subagent:`` ...) is not a nudge-able session.
+    keys dashboard loops on the bare slot key); a channel-bound session key with a
+    fire adapter passes through unchanged. Anything else (``cron:``, ``hook:``,
+    ``subagent:`` ...) is not a nudge-able session.
+
+    The pass-through set is narrower than :data:`_CHANNEL_KEY_PREFIXES` and is
+    enumerated rather than derived from it, because the two answer different
+    questions: that constant decides whether a key names a channel session (which
+    selects the fixed-interval timer), while this decides whether a loop may be
+    BOUND there, which additionally needs a delivery path. ``unified:`` can never
+    qualify -- it collapses several users' DMs into one bucket, so there is no
+    single conversation to deliver to.
 
     Single source of truth shared by the ``monitor_start`` MCP tool and the
     workflow ``ctx.nudge`` port so both agree on what "nudge-able" means.
@@ -112,7 +133,7 @@ def binding_key_for(session_key: str) -> str | None:
         return None
     if session_key.startswith("dashboard:"):
         return session_key.split(":", 1)[1]
-    if session_key.startswith(("slack:", "discord:")):
+    if session_key.startswith(("slack:", "discord:", "webex:")):
         return session_key
     return None
 

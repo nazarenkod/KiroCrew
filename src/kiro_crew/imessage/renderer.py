@@ -28,7 +28,7 @@ from kiro_crew.imessage.client import redact_handle
 from kiro_crew.imessage.plaintext import chunk_plaintext, to_plaintext
 from kiro_crew.imessage.rpc import RpcError, RpcTransportError
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.renderer import Renderer
+from kiro_crew.messaging.renderer import Renderer, split_options_trailer
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -71,14 +71,12 @@ def _strip_options(text: str) -> str:
     iMessage has no tappable chips, so the trailer is dropped entirely -- the
     user just replies naturally. Also hides a partial ``[OPTIONS...`` fragment
     (no closing ``]``) so it never lands as raw text.
+
+    The parse — including the fragment hold-back, which is a leak guard and
+    not a nicety — lives in ``messaging.renderer.split_options_trailer``. This
+    channel renders no widget, so it keeps the body and discards the choices.
     """
-    m = _OPTIONS_RE.search(text)
-    if m:
-        return text[: m.start()].rstrip()
-    idx = text.rfind("[OPTIONS")
-    if idx != -1 and "]" not in text[idx:]:
-        return text[:idx].rstrip()
-    return text
+    return split_options_trailer(text)[0]
 
 
 class IMessageRenderer(Renderer):

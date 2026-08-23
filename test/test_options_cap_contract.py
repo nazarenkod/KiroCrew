@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import asyncio
 
-from kiro_crew.messaging.renderer import apply_options_cap, cap_choices
+from kiro_crew.messaging.renderer import (
+    append_options_text,
+    apply_options_cap,
+    cap_choices,
+    split_options_trailer,
+)
 from kiro_crew.messaging.transport import TransportCapabilities
 
 #: channel_type -> the test class below that pins its enforcement.
-PINNED_WIDGET_CHANNELS = {"slack", "discord", "telegram"}
+PINNED_WIDGET_CHANNELS = {"slack", "discord", "telegram", "webex"}
 
 
 def _all_channel_capabilities() -> dict[str, TransportCapabilities]:
@@ -375,3 +380,219 @@ class TestDiscordEnforcement:
 
         asyncio.run(_go())
         assert "IOSFODNN7EXAMPLE" not in cli.final_text()
+
+
+class TestZeroWidgetTextFallback:
+    """``append_options_text`` — the ``max_buttons=0`` counterpart of the cap.
+
+    A channel with no interactive widget used to DELETE the trailer, so the user
+    read a question with no visible answers. Numbering them into the body keeps
+    them answerable by typing, which every channel supports.
+
+    The sanitisations are the reason this lives in shared code rather than per
+    channel: the body is markdown-parsed, so a credential split by a code span is
+    whole on screen, and the body is also where platforms parse mentions.
+    """
+
+    def test_choices_are_numbered_from_one(self) -> None:
+        # Numbering starts at 1, not after a widget's slots: there is no widget.
+        assert append_options_text("Pick one", ["A", "B", "C"]) == "Pick one\n\n1. A\n2. B\n3. C"
+
+    def test_no_choices_leaves_the_body_byte_identical(self) -> None:
+        assert append_options_text("Body", []) == "Body"
+
+    def test_an_empty_body_yields_just_the_list(self) -> None:
+        assert append_options_text("", ["A"]) == "1. A"
+
+    def test_a_body_ending_in_one_newline_still_gets_a_paragraph_break(self) -> None:
+        # A single trailing newline is mid-paragraph in every markdown dialect,
+        # so the list would render inline without the extra break.
+        assert append_options_text("Body\n", ["A"]) == "Body\n\n1. A"
+
+    def test_a_credential_split_by_markup_is_redacted_in_display_form(self) -> None:
+        """The driver's byte-level redactor saw the key broken; the reader will
+        not. Both halves must be scrubbed at this sink."""
+        out = append_options_text("Pick", ["use AKIA`" + "A" * 16 + "`"])
+        assert "AKIA" + "A" * 16 not in out.replace("`", "")
+
+    def test_mass_mention_syntax_is_defanged(self) -> None:
+        # A prompt-injected choice would otherwise mass-notify a whole workspace.
+        out = append_options_text("Pick", ["@everyone", "<!channel>"])
+        assert "@everyone" not in out
+        assert "<!channel>" not in out
+
+    def test_non_ascii_choices_are_not_mangled(self) -> None:
+        out = append_options_text("Pick", ["日本語", "café"])
+        assert "日本語" in out and "café" in out
+
+    def test_the_zero_cap_branch_of_apply_options_cap_is_unchanged(self) -> None:
+        """The new helper is additive.
+
+        ``apply_options_cap``'s "keep nothing, leave the body alone" contract is
+        what the widget-capable callers rely on, so it stays exactly as pinned.
+        """
+        caps = TransportCapabilities(max_buttons=0)
+        assert apply_options_cap("Body", ["A", "B"], caps) == ("Body", [])
+
+
+class TestSplitOptionsTrailer:
+    """The shared trailer parse, used by every zero-widget channel.
+
+    Its second branch is a leak guard, not a nicety: a trailer still streaming in
+    has no knowable choices, so it must be HIDDEN rather than rendered. That rule
+    used to be reimplemented per channel, which is how a channel ends up leaking
+    reserved protocol into the conversation as raw text.
+    """
+
+    def test_a_complete_trailer_is_split_off(self) -> None:
+        assert split_options_trailer("Pick one\n\n[OPTIONS: A | B | C]") == (
+            "Pick one",
+            ["A", "B", "C"],
+        )
+
+    def test_choices_are_stripped_and_blanks_dropped(self) -> None:
+        assert split_options_trailer("Q [OPTIONS:  A  |  | B ]")[1] == ["A", "B"]
+
+    def test_an_unterminated_trailer_is_hidden_with_no_choices(self) -> None:
+        assert split_options_trailer("Pick one\n\n[OPTIONS: A | B") == ("Pick one", [])
+
+    def test_text_with_no_trailer_is_returned_unchanged(self) -> None:
+        assert split_options_trailer("just an answer") == ("just an answer", [])
+
+    def test_a_trailer_mid_text_is_not_a_trailer(self) -> None:
+        # The grammar is end-anchored: a bracketed literal a user typed mid-answer
+        # is content, not protocol.
+        body, choices = split_options_trailer("see [OPTIONS: a] above and more")
+        assert body == "see [OPTIONS: a] above and more" and choices == []
+
+    def test_leading_whitespace_is_preserved(self) -> None:
+        # rstrip only: stripping the left would silently re-indent code.
+        assert split_options_trailer("    indented\n[OPTIONS: A]")[0] == "    indented"
+
+    def test_an_unterminated_tag_is_not_redos(self) -> None:
+        # Regression (py/polynomial-redos): a lazy ``\s*(.*?)`` body could consume
+        # a "[" that ALSO starts the outer "[OPTIONS:" literal, so over text with
+        # many "[OPTIONS:" prefixes search() re-explored the body from each
+        # position — polynomial. The tempered OPTIONS_RE_TRAILER forbids only a
+        # re-occurring "[OPTIONS:", making the body unambiguous (linear). A
+        # whitespace-padded unterminated tag and many repeated prefixes (the real
+        # pump) must both return promptly.
+        import time
+
+        evil = "[OPTIONS:" + ("\t" * 200_000) + "x"
+        start = time.perf_counter()
+        assert split_options_trailer(evil)[0] == ""
+        assert time.perf_counter() - start < 1.0, "possible ReDoS"
+
+        evil = "[OPTIONS:" * 100_000 + "x"
+        start = time.perf_counter()
+        split_options_trailer(evil)
+        assert time.perf_counter() - start < 1.0, "possible ReDoS"
+
+    def test_every_zero_widget_channel_routes_through_it(self) -> None:
+        """The reason the parse was hoisted: four copies became one caller each.
+
+        Weixin is deliberately absent — its variant has different whitespace
+        semantics and no fragment guard, so converging it is a behaviour change
+        that belongs in its own commit rather than riding along here.
+        """
+        from kiro_crew.imessage import renderer as imessage_renderer
+        from kiro_crew.teams import renderer as teams_renderer
+        from kiro_crew.wecom import renderer as wecom_renderer
+
+        for mod in (teams_renderer, imessage_renderer, wecom_renderer):
+            assert mod._strip_options("Answer\n\n[OPTIONS: a | b]") == "Answer"
+            assert mod._strip_options("Answer\n\n[OPTIONS: a | b") == "Answer"
+            assert mod._strip_options("plain") == "plain"
+
+
+class TestWebexEnforcement:
+    def test_card_actions_cap_at_declared_and_overflow_is_visible(self) -> None:
+        """Drive the REAL render path, not the helper.
+
+        The ratchet exists because a renderer can call the shared cap and then
+        build its widget from the uncapped list, so the only assertion worth
+        making is against what the client was actually asked to send.
+        """
+        import asyncio
+
+        from test_webex_renderer import FakeClient
+
+        from kiro_crew.messaging.renderer import DONE, TEXT_CHUNK, OutputEvent
+        from kiro_crew.webex.renderer import WebexRenderer
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        n = WEBEX_CAPABILITIES.max_buttons
+        trailer = " | ".join(f"Choice {i}" for i in range(1, n + 4))
+        cli = FakeClient()
+        # A card is rendered only when its press can be resolved, so the real path
+        # needs the dispatcher's choice store — the card is the last thing a turn
+        # sends, and a renderer-owned map is gone before any press arrives.
+        r = WebexRenderer(
+            cli,
+            "ROOM",
+            WEBEX_CAPABILITIES,  # type: ignore[arg-type]
+            publish_choices=lambda _nonce, _choices: None,
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.dispatch(OutputEvent(kind=TEXT_CHUNK, text=f"Pick.\n\n[OPTIONS: {trailer}]"))
+            await r.dispatch(OutputEvent(kind=DONE, stop_reason=""))
+
+        asyncio.run(_go())
+
+        card = next(kw for (_, _, kw) in cli.sent_full if kw.get("attachments"))
+        actions = card["attachments"][0]["content"]["actions"]
+        labels = [a["title"] for a in actions]
+        assert len(labels) == n, "webex card actions were uncapped"
+        assert labels == [f"Choice {i}" for i in range(1, n + 1)]
+        # Overflow is numbered CONTINUING the widget slots, never dropped.
+        final = cli.edits[-1][2]
+        assert f"{n + 1}. Choice {n + 1}" in final
+        assert f"{n + 3}. Choice {n + 3}" in final
+
+    def test_a_press_resolves_by_index_not_by_text(self) -> None:
+        """A crafted press must not be able to inject words into the turn.
+
+        The button carries an index into the choices the renderer rendered, so a
+        forged ``kirocrew_choice`` either indexes a real choice or resolves to
+        nothing — it can never become arbitrary text.
+        """
+        import asyncio
+
+        from test_webex_renderer import FakeClient
+
+        from kiro_crew.messaging.renderer import DONE, TEXT_CHUNK, OutputEvent
+        from kiro_crew.webex.cards import KEY_CHOICE, KEY_NONCE, LiveChoices, read_press
+        from kiro_crew.webex.renderer import WebexRenderer
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        cli = FakeClient()
+        live = LiveChoices()
+        r = WebexRenderer(
+            cli,
+            "ROOM",
+            WEBEX_CAPABILITIES,  # type: ignore[arg-type]
+            publish_choices=lambda nonce, choices: live.publish("S", nonce, choices),
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.dispatch(OutputEvent(kind=TEXT_CHUNK, text="Pick.\n\n[OPTIONS: Yes | No]"))
+            await r.dispatch(OutputEvent(kind=DONE, stop_reason=""))
+
+        asyncio.run(_go())
+        card = next(kw for (_, _, kw) in cli.sent_full if kw.get("attachments"))
+        data = card["attachments"][0]["content"]["actions"][1]["data"]
+        _, choice, nonce, _ = read_press(data)
+
+        # A forged index, a forged nonce, and injected text all resolve to nothing.
+        assert live.take("S", "99", nonce) == ""
+        assert live.take("S", choice, "deadbeefdeadbeef") == ""
+        assert live.take("S", "rm -rf /", nonce) == ""
+        assert read_press({KEY_CHOICE: "x", KEY_NONCE: "y"})[0] == ""
+        # The real press resolves once, and only once: the platform cannot retire
+        # the buttons, so the ENTRY is what has to expire.
+        assert live.take("S", choice, nonce) == "No"
+        assert live.take("S", choice, nonce) == ""

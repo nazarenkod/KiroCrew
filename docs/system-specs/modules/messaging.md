@@ -34,9 +34,10 @@ Slack's transport path is gated behind the `messaging.use_transport` config flag
 | `messaging/__init__.py` | Package facade re-exporting the public contracts, approval-mode constants, and Layer-3 helpers |
 | `messaging/transport.py` | **Layer 1** — `MessagingTransport` ABC + the `TransportCapabilities`, `InboundMessage`, and `ConfiguredChannelTarget` value objects (stdlib-only) |
 | `messaging/driver.py` | **Layer 2** — `TurnDriver` (channel-neutral turn loop), approval-mode constants, `_redact` helper |
-| `messaging/renderer.py` | **Layer 2b** — `Renderer` ABC, `OutputEvent`, output-kind constants + `OUTPUT_KINDS`, `chunk_text` helper, `apply_options_cap`/`cap_choices`/`format_overflow` (`max_buttons` enforcement) |
+| `messaging/approval.py` | **Layer 2c** — `PendingApprovals` + `SessionApprovalDecider`: the shared awaiter behind an INTERACTIVE `decider`. A process-global map keyed `session_key:request_id` (ACP request ids restart at 1 per session), deny-by-default on timeout. Channels supply only HOW the user answers |
+| `messaging/renderer.py` | **Layer 2b** — `Renderer` ABC, `OutputEvent`, output-kind constants + `OUTPUT_KINDS`, `chunk_text` helper, `apply_options_cap`/`cap_choices`/`format_overflow` (`max_buttons` enforcement), and `append_options_text` — the numbered-text sink for a channel with no widget, or one whose widget cannot be trusted to deliver the press |
 | `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` — credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel |
-| `messaging/split.py` | `split_markdown_safe` — the shared fence-safe markdown splitter (stdlib-only, pure). Prefix-stable so streaming callers can send sealed chunks and keep only the last as a live buffer. Also exports `iter_fence_spans`, the same fence machine viewed as character spans over a whole message |
+| `messaging/split.py` | `split_markdown_safe` — the shared fence-safe markdown splitter (stdlib-only, pure). Prefix-stable so streaming callers can send sealed chunks and keep only the last as a live buffer. `split_markdown_bytes` wraps it for a byte-capped platform, measuring the produced chunks and shrinking the character budget until they fit, with the `chunk_utf8_bytes` primitive as the floor. Also exports `iter_fence_spans`, the same fence machine viewed as character spans over a whole message |
 | `messaging/outbound_files.py` | `extract_local_refs` (+ `extract_local_refs_off_loop`) — pulls local markdown image references out of an outbound reply into `OutboundFile` payloads carrying the validated bytes, with `Rejection` reasons for everything refused. Also `iter_local_refs` / `hide_local_refs`, the text-only scan a streaming channel uses to keep the markup off live frames. Channel-neutral; the upload stays per-transport |
 | `messaging/raster.py` | `sniff_raster_mime` — what counts as a raster, decided by leading bytes. Dependency-free (no `kiro_crew` imports) so both the inbound sniff and the outbound extractor can share it |
 | `messaging/tables.py` | `render_tables` + the `off`/`cards`/`grid`/`native`/`auto` policy contract and `display_width` — outbound Markdown-table rendering for a target that shows a pipe table as literal pipes (stdlib-only, pure) |
@@ -135,7 +136,7 @@ Constructed with a `TransportCapabilities`. `dispatch(event)` routes each kind t
 - `on_tool_call(tool_call_id, title, tool_kind="", tool_purpose="")` — abstract; mirrors native uniform tool-call semantics (each call marks the previous task complete and starts a new in-progress task).
 - `on_prompt_choice(options, request_id)` — abstract; renders the interactive approval/choice prompt.
 - `on_compaction(context_usage_pct)`, `on_done(stop_reason="")` — abstract.
-- `on_steer_consumed(summary="")` — default no-op; Discord/Telegram seal the pre-steer segment and open the continuation with a native acknowledgement chip using the parsed summary, without receiving raw protocol text.
+- `on_steer_consumed(summary="")` — default no-op; Discord/Telegram seal the pre-steer segment and open the continuation with a native acknowledgement chip using the parsed summary, without receiving raw protocol text. Webex records the fold and notes it on the final answer instead, because a separate message per fold would bury the answer and it has no spare edit to spend on one.
 
 ### `SilentRenderer` — enforcing a dashboard channel disconnect
 
@@ -336,12 +337,22 @@ Telegram's forum routing stays entirely channel-local. `_handle_busy` and
 `_drain_queue` deliberately stay per-channel: they re-enter their own
 `handle_message` and own the per-channel `_active_renderers`.
 
-The remaining channels (Webex, WeCom, Teams, Weixin) implement `_handle_busy`
-as **steer-only**: they fold the message into the running turn and reply with a
+**Webex** also queues, on the shared pipeline rather than a fork. `drive_turn` is
+awaited and releases the session semaphore in its `finally`, so by the time the
+call returns the session is free and the dispatcher drains by re-entering its own
+`handle_message`. Its receipt lives on its own message, which matters here
+because Webex caps edits **per message**: a receipt on a separate message has its
+own allowance and never competes with the answer placeholder's reserved final
+edit. Adapting rather than forking is deliberate — leaving the shared pipeline
+would mean re-deriving mute substitution, identity publication, the PreToolUse
+gate, the auto-approve hook and four guarded post-turn steps for one feature.
+
+The remaining channels (WeCom, Teams, Weixin) implement `_handle_busy` as
+**steer-only**: they fold the message into the running turn and reply with a
 one-shot notice, or ask the user to resend when steer is unavailable. They have
 no receipt and no drain, because their reply is bound to the inbound request
-(WeCom, Weixin) or has no editable-receipt affordance, so a hold-then-deliver
-follow-up turn could not be delivered reliably later.
+(WeCom, Weixin) or they cannot edit a sent message at all (Teams, Weixin), so a
+hold-then-deliver follow-up turn could not be delivered reliably later.
 
 ### `steer` (the default): fold into the running turn
 
@@ -540,6 +551,20 @@ Full new-path dispatch: fires the ack reaction + working status immediately (con
 - **Channel dashboard visibility is immediate**: after the first successful turn of a Discord, Telegram, Webex, Teams, WeCom, or Weixin-owned session is persisted, the dispatcher triggers the channel-slot reconciler immediately when `dashboard.surface_channel_sessions` is enabled. `DashboardState.register_channel_transport` injects the dashboard state into the bound dispatcher; the lifetime 30-second reconciler remains the recovery path, but the normal first-turn path does not wait for it. Turns that resume an existing `dashboard:` session skip this step because that session already owns a slot.
 - **Configured outbound targets are transport-owned**: `MessagingTransport.configured_targets()` returns opaque `ConfiguredChannelTarget` records for the user-configured destinations a dashboard session may link to, including an explicit unavailable reason when a protocol needs prior inbound state or cannot send proactively. `resolve_configured_target()` revalidates the selected opaque id at the side-effect boundary and resolves it to `(conversation_id, thread_id)`; the browser never supplies an unchecked platform conversation id. Discord exposes configured users and threads, and fail-closes thread resolution unless Discord still reports the allow-listed id as an actual thread rather than a normal shared guild channel; Telegram and Webex expose configured DMs; Weixin exposes allow-listed DMs plus authorized peers learned under its open policy; Teams destinations become available after an authorized inbound activity supplies a conversation/service URL; and WeCom destinations (including its allow-all policy placeholder) remain visible but unavailable because its reply token is inbound-bound.
 - **Configured-target egress is governed at every yield boundary**: the dashboard mirror-link endpoint enters the shared fail-closed `channels` governance ladder before resolving an opaque target (resolution may itself open a remote DM), rechecks before the initial link message, and rechecks before each historical-context message. A profile that narrows after transport startup therefore stops both target resolution and all subsequent sends.
+- **A capability the driver accepts, the shared pipeline must forward**: `drive_turn` hands `TurnDriver` every rung a forked dispatcher does, including `auto_approve_session`. Omitting one is not a missing feature but an ASYMMETRY, and it fails silently in the direction that LOOKS safe and is merely useless: the field existed on the driver while the pipeline never passed it, so an operator's `/yolo` grant — taken from the dashboard toggle or Telegram's `/yolo`, both of which write the same process-global grant — was inert on every channel riding `drive_turn`. Discord's fork does not pass it either, and has no `/yolo`; Telegram's does. The predicate is read PER REQUEST, never captured at turn start, so a mid-turn revoke takes effect on the next tool. The PreToolUse `tool_gate` still runs first, so a hard deny can never be overridden by it.
+- **A channel conversation binds itself as origin AND mirror, every turn**: a dispatcher supplies `ChannelTurn.origin_conversation` and `drive_turn` records it via `set_origin_link` (so unattended output — the auto-compact notice — has a target) and `bind_origin_mirror` (so a turn later taken from the dashboard comes back to the chat). Re-asserted on every turn, because a restart, an unlink elsewhere, or a rival claim can REMOVE the binding and none of them repoints one; a binding already aimed elsewhere is therefore left alone. Guarded as a pair at the call site: losing the mirror costs a convenience, while raising there costs the user the answer they are waiting for, and this is the widest call site in the codebase. A channel that omits the field keeps its conversations unmirrored, which is why the roster in `autonudge._CHANNEL_KEY_PREFIXES` is narrower than `CHANNEL_SESSION_NAMESPACES` — a loop with no bound conversation fires into nothing while reporting itself healthy.
+- **A proactive send addresses an OPAQUE target, never a platform id**: `POST
+  /api/send-message` takes `{channel_type, target_id}` for a non-Slack channel and
+  resolves the id through that transport's `resolve_configured_target`, which
+  re-applies the channel's own allow-list at the side-effect boundary. That
+  matters because the endpoint is reachable by the LLM and the id travels through
+  the browser: a raw conversation id would let a caller name any destination, and
+  a config that narrowed after the id was minted would not take effect. Four gates
+  run, all fail-closed: a registered transport (membership, never `!= "slack"`),
+  `supports_proactive_send`, the `channels` governance chokepoint, then the
+  allow-list. The `send_message` MCP tool vets the transport it NAMES rather than
+  the literal "slack", because the scope is per-transport. Every non-2xx body
+  carries a machine-readable `code`, since backend strings have no catalog path.
 - **Own-channel vs. mirror**: `ChannelLink` models a session's own inbound channel only; the dashboard→Slack mirror binding stays in `SessionMap.get/set_slack_link` (guardrail G3). The generalized channel-neutral outbound mirror (`SessionMap.set_mirror_link`) stores a `ChannelLink` under the `mirror` slot for non-Slack channels, still distinct from the session's own inbound link.
 - **Managed-MCP session-key resolution**: every turn-running surface publishes `session_pid_<pid>.txt` (with an HMAC-SHA256 sidecar) through the single shared helper `messaging.identity.publish_turn_identity` (which calls `session_pid_sig.publish_session_pid`), keyed by the session's kiro-cli host PID, so the gateway's ancestor PID-walk resolves the caller's `X-Session-Key`. One writer is called by the dashboard, native Slack, and every shipped channel transport-dispatch surface: Telegram (DM + forum), Discord, Slack, Webex, WeCom, Teams, and Weixin (through the shared `drive_turn`). Any surface that omits it makes every session-keyed managed MCP tool (`learn_add`, cron management, …) fail with HTTP 400 `missing X-Session-Key` from that channel's turns; the identity-topology test guards every dispatcher against regressing.
 
@@ -735,10 +760,19 @@ task so the receive loop keeps breathing during long turns. Outbound is REST
 (`POST/PUT/DELETE /v1/messages`) with a single 429 `Retry-After` back-off; an
 email-shaped conversation id maps onto `toPersonEmail` (opens/reuses the 1:1
 space server-side). Outbound markdown is bounded in UTF-8 BYTES, not
-characters — Webex's limit is 7439 bytes. Final answers are split losslessly
-into 7000-byte chunks (``chunk_utf8``, never splitting a code point) and
-single sends are tail-guarded by ``truncate_utf8`` as a last resort, so a
-multibyte-heavy reply is never rejected wholesale or silently truncated. The reconnect loop uses exponential backoff with a
+characters — Webex's limit is 7439 bytes. Final answers go through
+``messaging.split.split_markdown_bytes``, which runs the shared fence-safe
+splitter against a character budget and shrinks that budget until every chunk
+measures under 7000 UTF-8 bytes, falling back to the ``chunk_utf8_bytes``
+primitive only for a fragment that admits no clean cut; single sends are
+tail-guarded by ``truncate_utf8`` as a last resort. So a multibyte-heavy reply is
+never rejected wholesale or silently truncated, and a code fence spanning a chunk
+boundary is reopened rather than left unbalanced. Redelivery is handled at the
+frame: each processed activity is acknowledged (``{"type": "ack", ...}``) and its
+message id remembered in a bounded FIFO, because an unacked activity is redelivered
+and a redelivery arriving mid-turn would otherwise be folded in as a steer — the
+agent steered by an echo of the instruction it is already following. The reconnect
+loop uses exponential backoff with a
 minimum-healthy-connection guard so a bad token can never hot-loop.
 ``client.ready`` (asyncio.Event) is set on connect+authorize and cleared on
 disconnect; ``maybe_start_webex`` reports ``connected`` only after
@@ -748,25 +782,158 @@ reason).
 
 **Security model.** `authorize` is deny-by-default against
 `webex.allowed_emails` (lowercased comparison); every denial is SEL-audited.
-Direct-rooms-only fail-closed: any message from a non-`direct` room is
-rejected even from allow-listed users so tool output can never land in a
-group space. Self-messages are dropped twice (WS actor email + hydrated
-`personId` against the bot identity). `WEBEX_BOT_TOKEN` is on the sandbox
-agent env denylist.
+Self-messages are dropped twice (WS actor email + hydrated `personId` against
+the bot identity). `WEBEX_BOT_TOKEN` is on the sandbox agent env denylist.
 
-**Dispatch + rendering.** Turns ride the shared `TurnDriver`
-(`transport_dispatch.py` mirrors the WeCom dispatcher: `/new`, `/compact`,
-`/help` command intercept, mid-turn messages fold into the running turn via
-steer gated on `has_active_turn`, `/compact` under atomic `try_acquire`,
-soft/hard context-threshold notices as separate proactive messages). The
-renderer is shaped by Webex's 10-edits-per-message cap: no typewriter
-streaming (`streaming=False`); a "🤔 Thinking…" placeholder is posted at turn
-start, tool-progress status edits are throttled and budgeted to 6 of the 10
-edits (an edit failure burns the remaining budget so the final-answer edit
-can never race the cap), and the final answer lands as one placeholder edit
-with a fresh-message fallback plus chunked follow-ups past the 7000-char cap.
-Trailing `[OPTIONS:]` markup is stripped (`max_buttons=0`); interactive tool
-approvals run decider-less (deny-by-default under INTERACTIVE mode).
+The ROOM gate is separate from the sender gate, and a group message must clear
+BOTH. A direct room is always permitted. A group space is permitted only when
+`webex.allow_group_rooms` is on AND the space is in `webex.allowed_room_ids`,
+which is deny-all by default — so enabling the switch alone grants nothing. The
+gate is positive membership (`room_type == ROOM_DIRECT` / `ROOM_GROUP`), never
+`!= "direct"`, so a room type this code has not seen inherits nothing. Group
+spaces are off by default because a reply there is readable by every member,
+including people the email allow-list excludes; for the same reason a group turn
+constructs its renderer with `uploads_allowed=False` (a local file reference keeps
+printing the path) and `_handle_dashboard` refuses outside a direct room.
+
+An Adaptive Card press reports no `roomType` on the wire, so the client resolves
+it (`_room_type_of`, cached) before dispatch rather than letting the gate
+special-case it — a second branch there has to guess, and a guess that admits a
+press by room id alone drops every DM press the moment a space is named. The
+`denied_room_not_permitted` record carries the room id, which is the one thing an
+operator needs from it: a Webex room id is opaque and has no UI that shows it.
+
+A space is its OWN conversation. `_route_of` returns the sender's email for a
+direct room and `space:{room_id}` for a group space, and that one string is the
+`ConversationState` bucket, the generation seed AND the session-key scope — so
+they cannot disagree about which conversation a message routes to. The space is
+namespaced `CHAT_TYPE_FORUM`, which is what keeps it out of the `unified` DM
+bucket. Routing a space to a participant's DM key would answer their private
+history into the room, make a mid-turn DM steer into the space turn, and let
+`/new` in the space reset their DM.
+
+In a space Webex only delivers messages that @mention the bot and does NOT strip
+the mention, so `commands.strip_bot_mention` removes a LEADING mention of the
+bot's own name (matched on a word boundary, so `Kiro` does not eat the `Kiro` in
+`KiroCrew`). A mention later in the sentence is content and is left alone.
+
+**Files.** `files_inbound` and `files_outbound` are both live. Inbound: a message
+arrives on the `share` verb (not `post`), so the accepted-verb set is what makes
+file messages visible at all; `webex/attachments.py` HEADs each opaque
+`/v1/contents/{id}` URL for its name/type/size and hands the result to the shared
+`messaging.attachments` ingest, which owns caps, classification, signature
+sniffing and temp-file ownership. The download honours Webex's anti-malware state
+machine — 423 retry-after (bounded), 410 infected, 428 unscannable, all refused
+rather than passed `?allow=unscannable` — and refuses a URL outside the API base
+so the bearer token cannot be sent elsewhere. The `update` verb fires when a scan
+clears and is acted on only once every file reads a safe quarantine state; a
+pending scan is deliberately NOT dedup-marked, so the later clearing update is
+not mistaken for a redelivery. Outbound: `client.send_file` takes the validated
+BYTES from `messaging.outbound_files`, never a path — re-opening the path would
+resolve the name a second time and could upload something no gate saw. One file
+per message is Webex's limit, so a run of files is a run of messages.
+
+**Adaptive Cards** are Webex's Block Kit analogue (`webex/cards.py`, schema 1.3,
+one card per message) and `rich_blocks` gates whether one is attached at all. A
+press returns as the `cardAction` verb whose `inputs` map merges the pressed
+action's own `data`, which is how the routing key round-trips — the same
+mechanism as a Slack `action_id`. Three things make a press safe: the reserved
+`data` keys are namespaced so a card input cannot forge a decision; a choice
+travels as an INDEX into the choices that renderer rendered, so a crafted press
+cannot inject text; and each card carries a per-prompt nonce compared in constant
+time, which is what retires a resolved card — Webex refuses to edit a message
+carrying an attachment, so its buttons stay clickable forever otherwise. A card
+is always accompanied by the text form, which works on its own.
+
+**Geo routing.** A Hydra id names a CLUSTER, and synthesising `us` makes a
+non-US-resident org drop every inbound message silently: the REST fetch resolves
+nothing and the failure surfaces as no reply behind a green badge. The cluster is
+therefore read from the activity's own `target.globalId` and remembered per
+connection, and the WDM host is discovered per token from the U2C service catalog
+(falling back to the documented US host, so a discovery outage degrades rather
+than taking the channel down, and never to a plaintext host — the bearer token
+rides these requests). `webex.wdm_base` PINS a **Webex** host for a restricted network. It is
+suffix-checked against `*.wbx2.com` / `*.webex.com` / `*.ciscospark.com` over
+https and dropped (loudly, falling back to discovery) otherwise, because
+`config.json` is agent-writable by design — `security.py` deliberately does not
+over-block it — and the bot token rides device registration, so a value from a
+prompt-injected `config set` would otherwise POST the token wherever it named. An
+outbound proxy belongs in `HTTPS_PROXY`, which the client honours separately. The
+same suffix rule is applied to the catalog's own `serviceLinks.wdm` as defence in
+depth. Otherwise:
+the pin is held separately from the host in use and skips discovery entirely,
+because discovery WRITES the host in use, so a pin stored only there is destroyed
+by the first successful discovery and the config key silently becomes a no-op
+after one connect. An empty value is what means "discover", so no caller may
+default it.
+
+**Dispatch + rendering.** Turns ride the shared `drive_turn` / `TurnDriver`
+pipeline. `transport_dispatch.py` intercepts the command surface (`/new`,
+`/compact`, `/help`, `/stop` + `/cancel`, `/link`, `/unlink`, `/yolo`,
+`/kirocrew dashboard`, `/model`, `/sessions`, plus the `/queue` and `/steer`
+per-message overrides),
+queues or steers mid-turn messages, drains the queue after the turn, runs
+`/compact` under atomic `try_acquire`, and posts soft/hard context-threshold
+notices as separate proactive messages. `COMMAND_SPEC` in `commands.py` generates
+the `/help` card, so the card cannot drift from the parser; an unrecognised
+`/token` answers with the card rather than spending a turn having the model
+explain it. `/compact` reads the compaction RESULT rather than assuming success —
+the ACP client synthesizes a completion whenever text streamed, so a compaction
+that reported `timeout` or `failed` used to be announced as done.
+
+**Interactive tool approvals accept a typed reply OR an Adaptive Card press.**
+`on_prompt_choice` posts its own message asking for `1` (approve) or `2` (deny),
+with an Approve/Deny card attached. The typed reply is PRIMARY, not a fallback:
+Webex refuses to edit a message once it carries an attachment, so a resolved
+card's buttons stay clickable forever, and the inbound half of a press rides the
+undocumented device websocket. The dispatcher intercepts either ahead of the steer
+path, because the session semaphore is held for the whole turn so an answer
+necessarily arrives while the session is busy. An unrecognised reply still steers,
+so a user who ignores the prompt does not lose their message.
+
+The pending-decision registry is channel-neutral (`messaging/approval.py`): a
+process-global map keyed `session_key:request_id` because ACP request ids restart
+at 1 per session, deny-by-default on timeout, and a timeout also signals
+`autonudge.notify_approval_stalled` so an unattended loop deactivates instead of
+burning its cycle budget being denied. The card's nonce is minted by that registry
+against the pending entry and validated INSIDE `resolve()`, as a precondition:
+checking it around the call would approve the tool first and only then discover
+the press was stale. A press carrying no nonce or request id fails closed, and
+every outcome — honoured, stale, expired — emits a SEL record, because a forged
+press leaves no other trace. A channels-governance deny blocks an approve but
+still resolves a deny, so a policy that forbids the channel does not strand the
+tool request for the whole window. An answer that matches nothing is reported
+neutrally ("already answered or timed out"), never as a denial: with buttons the
+platform cannot retire, "already answered" is the common case and claiming a
+denial would tell a user their approved tool was refused.
+
+The renderer is shaped by Webex's 10-edits-per-message cap: no typewriter
+streaming (`streaming=False`). A "🤔 Thinking…" placeholder is posted at turn
+start; status frames carry the running tool AND a bounded tail of the answer
+buffered so far, so a long agentic turn shows the answer forming instead of a bare
+tool name. The budget is split explicitly — status frames get 8 of the 10 edits,
+2 are reserved for the final answer, and a failed edit burns the remaining status
+budget so the final edit can never race the cap. Frames are paced by a DOUBLING
+interval rather than a flat one: a flat throttle spends the whole budget in the
+first few seconds and then freezes for the rest of the turn. The final answer
+lands as one placeholder edit with a fresh-message fallback plus chunked
+follow-ups. A folded steer is noted on that final edit rather than posted
+separately. `[OPTIONS:]` choices render as an Adaptive Card of one `Action.Submit` per
+choice, capped at `cards.MAX_CARD_ACTIONS` with the overflow numbered into the
+body by the shared `apply_options_cap` / `append_options_text` pair, so widget and
+text form ONE list. Card and press agree on button order through
+`cards.usable_choices`, the single derivation both read — deriving it twice would
+let one dropped blank choice shift every index after it, and the button would
+answer with its neighbour. What the card offered is published to
+`cards.LiveChoices`, owned by the DISPATCHER: the card is the last thing a turn
+sends, so a renderer-owned map would be gone before any press arrived. Entries are
+one-shot and expire by replacement, because the platform cannot retire the buttons.
+A press re-dispatches the label with `interpret_commands=False` — the label is
+model-authored, so a `[OPTIONS: … | /yolo on]` trailer must not become a command —
+and the choice is echoed first, since a press leaves no trace in the room. An
+unterminated `[OPTIONS…` fragment is still hidden, being truncated protocol rather
+than content. `on_done` delivers the WHOLE answer before uploads and the card, so
+neither interrupts a chunked reply.
 
 ## Webex settings API
 
@@ -774,14 +941,23 @@ approvals run decider-less (deny-by-default under INTERACTIVE mode).
   `connected` (true only while the device WebSocket is connected + authorized
   this session), `connect_error`, `configured` (token AND enabled AND non-empty
   allowlist — the transport fails closed on an empty list), `read_only`
-  (true unless the request is direct-local). Never returns a raw secret.
+  (true unless the request is direct-local), plus `enabled`, `allowed_emails`,
+  `allow_group_rooms`, `allowed_room_ids`, `reply_in_thread`,
+  `soft_threshold_pct`, `hard_threshold_pct` and `session_folder`. Never returns a
+  raw secret.
 - `PUT /api/webex/config` — requires a direct-local request (loopback peer
   AND no forwarding headers); remote gets 403. Validate-first/commit-last.
   New tokens (an accidental `WEBEX_BOT_TOKEN=` env line is stripped) are
   verified against Webex `GET /v1/people/me` before storage; rejection
   returns 400 and writes nothing, network failure saves with
   `verify_warning`. `bot_token_clear` must be a strict boolean.
-  `allowed_emails` accepts syntactically valid emails only. Secrets land in
+  `allowed_emails` accepts syntactically valid emails only.
+  `allowed_room_ids` is de-duplicated with order preserved and is otherwise
+  unvalidated: a Webex room id is an opaque base64 blob whose shape is the
+  platform's to define, and a format guess would reject a legitimate id from a
+  cluster this code has never seen. The two thresholds are clamped as a PAIR
+  through the same helper the config dataclass uses, so a soft value above the
+  hard one cannot make the soft nudge unreachable. Secrets land in
   `config_dir/.env` (atomic 0600) with `os.environ` synced; non-secrets go
   to `config.json` under `webex`, and any token set/clear purges the legacy
   `webex.bot_token` config fallback (config.json commits before .env so a

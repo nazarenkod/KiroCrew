@@ -26,7 +26,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.constants import OPTIONS_RE_TRAILER
-from kiro_crew.messaging.renderer import Renderer, chunk_text
+from kiro_crew.messaging.renderer import Renderer, chunk_text, split_options_trailer
 from kiro_crew.messaging.tables import TABLE_POLICY_CARDS
 from kiro_crew.messaging.transport import TransportCapabilities
 
@@ -52,14 +52,12 @@ def _strip_options(text: str) -> str:
     Teams (MVP) has no tappable chips, so we drop the trailer entirely -- the
     user just replies naturally. Also hides a partial ``[OPTIONS…`` fragment
     (no closing ``]``) so it never lands as raw text.
+
+    The parse — including the fragment hold-back, which is a leak guard and
+    not a nicety — lives in ``messaging.renderer.split_options_trailer``. This
+    channel renders no widget, so it keeps the body and discards the choices.
     """
-    m = _OPTIONS_RE.search(text)
-    if m:
-        return text[: m.start()].rstrip()
-    idx = text.rfind("[OPTIONS")
-    if idx != -1 and "]" not in text[idx:]:
-        return text[:idx].rstrip()
-    return text
+    return split_options_trailer(text)[0]
 
 
 class TeamsRenderer(Renderer):

@@ -110,6 +110,7 @@ const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // CLI command the user has to paste.
   'PrivacyPanel.tsx': 'privacy',
   'SlackPanel.tsx': { tab: 'channels', params: { channel: 'slack' } },
+  'WebexPanel.tsx': { tab: 'channels', params: { channel: 'webex' } },
   'DeveloperPanel.tsx': 'developer',
   'AboutPanel.tsx': 'about',
   'SttSettings.tsx': 'voice',

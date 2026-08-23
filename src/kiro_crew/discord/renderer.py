@@ -51,6 +51,7 @@ from kiro_crew.discord.client import (
     DISCORD_MAX_TEXT,
     DISCORD_MAX_TOTAL_UPLOAD_BYTES,
 )
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
@@ -102,7 +103,8 @@ _TYPING_REFRESH_S = 8.0
 _EDIT_THROTTLE_S = 1.2
 
 # Interactive approval wait; deny-by-default when it elapses with no press.
-_APPROVAL_TIMEOUT_S = 300.0
+# Owned by messaging.approval so every channel's window is the same one.
+_APPROVAL_TIMEOUT_S = APPROVAL_TIMEOUT_S
 
 # Button style constants (Discord component styles).
 _STYLE_PRIMARY = 1
