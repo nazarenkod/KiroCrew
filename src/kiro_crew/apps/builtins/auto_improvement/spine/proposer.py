@@ -26,6 +26,8 @@ import logging
 import subprocess
 from pathlib import Path
 
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
 from . import ledger as L
 from .contracts import TRACK_BUG, Candidate, Proposal, TargetProfile
 from .git_safety import GIT_SAFE_CONFIG, require_pinned
@@ -48,7 +50,7 @@ _GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     require_pinned(cwd)
     return subprocess.run(
-        ["git", "-C", str(cwd), *_GIT_SAFE_CONFIG] + args, capture_output=True, text=True
+        ["git", "-C", str(cwd), *_GIT_SAFE_CONFIG] + args, capture_output=True, **UTF8_TEXT
     )
 
 
@@ -105,7 +107,7 @@ class Proposer:
         subprocess.run(
             ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, "add", "-A"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
         )
         # EXCLUDE stray build/dependency artifacts the agent's tooling may drop in the
         # worktree (e.g. ``uv.lock`` from a ``uv`` invocation, ``.venv``, caches). They are
@@ -140,7 +142,13 @@ class Proposer:
                 ":(exclude).mypy_cache/**",
             ],
             capture_output=True,
+            # This diff is a PAYLOAD: it round-trips through Candidate.diff into
+            # ``git apply``. Strict decode (no errors=) keeps a non-UTF-8 byte a
+            # loud UnicodeDecodeError attributable to the capture, exactly as
+            # before the encoding was pinned -- errors="replace" would instead
+            # hand ``git apply`` a silently corrupted patch.
             text=True,
+            encoding="utf-8",
         ).stdout
 
     def propose_one(
