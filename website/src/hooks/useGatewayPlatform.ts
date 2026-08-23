@@ -23,9 +23,13 @@ export type GatewayPlatform = 'darwin' | 'windows' | 'other'
 export function classifyPlatform(raw: string | undefined | null): GatewayPlatform {
   const platform = raw ?? ''
   if (platform === 'darwin') return 'darwin'
-  // Matches the backend's own `sys.platform.startswith("win")` test, so the two
-  // sides cannot disagree about what counts as Windows.
-  if (platform.startsWith('win')) return 'windows'
+  // The gateway sends a human DISPLAY label, not `sys.platform`: the prerequisite
+  // snapshot reports `"Windows"` (see `_platform_label` in kiro_prerequisite.py),
+  // while Mochi's shell hands us the raw `process.platform` value `"win32"`.
+  // Case-fold the raw value so both `"Windows"` and `"win32"` classify as Windows;
+  // a lowercase-only `startsWith('win')` would collapse the display label to
+  // `'other'` and mis-gate every Windows-only affordance.
+  if (platform.toLowerCase().startsWith('win')) return 'windows'
   return 'other'
 }
 

@@ -43,6 +43,7 @@ import { sseSlotTitle, triggerRefresh, updateSlot } from '../store/dashboardSlic
 import { performSlotSwitch } from '../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
+import { revealOrOpen } from '../components/FilePathMenu'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import type { PlanStepInput } from '../api/client'
 import { useProvider } from '../providers'
@@ -575,7 +576,12 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
       title={fullPath}
       aria-label={i18nT('pages.chatPage.open_folder', { path: fullPath })}
       onClick={e => {
-        if (e && 'shiftKey' in e && e.shiftKey) { api.revealPath(fullPath); return }
+        // Shift+click copies the path on a remote session. Route through the
+        // shared helper, not bare `api.revealPath`: the transport call is
+        // side-effect-free, so the helper is what writes the clipboard (and,
+        // locally, drives the file manager). A bare call would silently copy
+        // nothing and break the chip's hover promise.
+        if (e && 'shiftKey' in e && e.shiftKey) { void revealOrOpen(fullPath); return }
         onOpen(fullPath)
       }}
     >
