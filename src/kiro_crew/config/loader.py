@@ -246,7 +246,15 @@ DEFAULT_AUTOCOMPACT_PCT = 70.0
 # absolute warn level at or above the configured threshold makes the warning arm
 # unreachable and the early signal disappears for whoever did not change the
 # default. Kept here rather than in either consumer so the two cannot drift.
-CONTEXT_WARN_MARGIN_PCT = 20.0
+#
+# 10 points, so the warning carries one fixed meaning — "within 10 points of
+# compaction" — whatever threshold the operator configures. Width is what makes
+# the signal readable: at 20 the warning covers the top 20 of the 70 usable
+# points on the default threshold and fires on every turn from half the context
+# window onward, which is where an always-on warning stops being read.
+# ``test_the_warning_stays_a_minority_of_the_usable_range`` holds the band under
+# a quarter of the range so it cannot widen back into noise.
+CONTEXT_WARN_MARGIN_PCT = 10.0
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
 )
