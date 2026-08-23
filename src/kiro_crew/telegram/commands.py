@@ -129,11 +129,29 @@ def parse_command_argument(text: str) -> str:
     return parts[1].strip() if len(parts) == 2 else ""
 
 
+#: Floor on a requested login-link lifetime, in seconds. ``parse_duration``
+#: accepts ``0h``/``0m`` and answers 0, which is a real int and not ``None``, so
+#: without a floor it passes every "did it parse" check and mints a bearer
+#: credential that is already expired: a link the user cannot use and no
+#: explanation of why. One minute is the floor because it is the shortest
+#: lifetime the ``<N>h``/``<N>m`` grammar can even express, so clamping here
+#: rejects exactly one input -- an explicit zero -- and leaves every duration a
+#: user can type untouched. Clamping rather than falling back to the default is
+#: what keeps the reply honest: both channels render the GRANTED value with
+#: ``format_ttl``, which can then never print ``0m``.
+#:
+#: Shared by value with the Discord parser: the two channels mint the same
+#: credential, so a floor on one and not the other is a hole. The pair is pinned
+#: by ``test/test_command_surface_fixes.py``.
+MIN_DASHBOARD_TTL_SECS = 60
+
+
 def parse_dashboard_ttl(text: str) -> int:
     """Parse the optional TTL from a ``/kirocrew dashboard [<N>h|<N>m]`` command.
 
-    Returns the session TTL in seconds. Defaults to 3600 (1 hour) when no
-    duration is given or the duration is unparseable.
+    Returns the session TTL in seconds, never below
+    :data:`MIN_DASHBOARD_TTL_SECS`. Defaults to 3600 (1 hour) when no duration is
+    given or the duration is unparseable.
     """
     from kiro_crew.dashboard.token_auth import parse_duration
 
@@ -142,7 +160,7 @@ def parse_dashboard_ttl(text: str) -> int:
     if len(parts) >= 3:
         parsed = parse_duration(parts[2].lower())
         if parsed is not None:
-            return parsed
+            return max(parsed, MIN_DASHBOARD_TTL_SECS)
     return 3600
 
 
