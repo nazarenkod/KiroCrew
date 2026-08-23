@@ -154,7 +154,10 @@ function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
         {/* Approval card */}
         {msg.msgType === 'approval' && onApprove && (
           <div className="mt-2">
-            <ApprovalCard title={msg.fromRole} toolInput={msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')} showButtons={approvalMode === 'normal'} onApprove={onApprove} />
+            {/* The channel `trust` decision is channel-wide and persisted to disk
+                (it sets the channel's trusted flag and saves it), so the trust-all
+                option must say that — the default label reads as session-scoped. */}
+            <ApprovalCard title={msg.fromRole} toolInput={msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')} showButtons={approvalMode === 'normal'} trustAllLabelKey="components.trustDropdown.trust_all_tools_channel" onApprove={onApprove} />
           </div>
         )}
         {/* Thread badge + reply */}

@@ -4,8 +4,11 @@ import ToolInputPreview from './ToolInputPreview'
 import TrustDropdown from './TrustDropdown'
 
 import { i18nT } from '../i18n/t'
-export default function ApprovalCard({ title, toolInput, showButtons, showTrust = true, onApprove }: {
+export default function ApprovalCard({ title, toolInput, showButtons, showTrust = true, trustAllLabelKey, onApprove }: {
   title: string; toolInput: string; showButtons: boolean; showTrust?: boolean
+  // Passed through to TrustDropdown: a surface whose `trust` decision grants
+  // more than the session (e.g. channel-wide, persisted) labels the real grant.
+  trustAllLabelKey?: string
   onApprove: (decision: string, pattern?: string) => void
 }) {
   const [decided, setDecided] = useState<string | null>(null)
@@ -32,7 +35,7 @@ export default function ApprovalCard({ title, toolInput, showButtons, showTrust 
       {showButtons && !decided && (
         <div className="mt-1.5 flex gap-1.5 flex-wrap">
           <button className={btnClass} onClick={() => handle('approved')}><CheckCircle className="lucide-inline" /> {i18nT('components.approvalCard.approve')}</button>
-          {showTrust && <TrustDropdown fullCommand={normalized} baseCommand={baseCmd} isShell={isShell} className={btnClass} onAction={(action, pattern) => handle(action, pattern)} />}
+          {showTrust && <TrustDropdown fullCommand={normalized} baseCommand={baseCmd} isShell={isShell} trustAllLabelKey={trustAllLabelKey} className={btnClass} onAction={(action, pattern) => handle(action, pattern)} />}
           <button className={btnClass + ' hover:!text-danger hover:!border-danger'} onClick={() => handle('rejected')}><Ban className="lucide-inline" /> {i18nT('components.approvalCard.reject')}</button>
         </div>
       )}
