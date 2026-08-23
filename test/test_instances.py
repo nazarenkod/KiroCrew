@@ -19,6 +19,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1052,6 +1053,10 @@ class _FakeTunnel:
         self.stopped = False
         self.start_result = True
         self._S = TunnelState
+        # Mirrors _SshTunnel.pid (None when no live child). connect() persists
+        # `tunnel.pid or 0` as the forwarder_pid hint; tests that assert a
+        # recorded pid set this to a concrete value via a factory wrapper.
+        self.pid = None
         # Recorded so transport-selection tests can assert which transport the
         # manager chose for this instance.
         self.transport = transport
@@ -3047,6 +3052,8 @@ class _ResilTunnel:
         self.transport = transport
         self.status = TunnelStatus(instance_id=iid, local_port=lp, remote_port=rp)
         self.start_result = True
+        # Mirrors _SshTunnel.pid; _mark_recovered persists it after a rebuild.
+        self.pid = None
 
     async def start(self):
         self.status.state = self._S.CONNECTED if self.start_result else self._S.ERROR
@@ -4731,3 +4738,302 @@ class TestSsmExitErrorClassification:
         t = _SshTunnel("dev", "dev-1", 7777, 7777)
         t._stderr_buf = "Permission denied (publickey)."
         assert "ssh auth failed" in t._exit_error(255)
+
+
+# ── #5235: hard-kill-orphaned forwarder reclaim (pid + exact-argv guard) ────
+
+
+class TestForwarderPidHints:
+    """The registry pid hint lifecycle: recorded on connect, moved by recovery,
+    cleared by disconnect. Fake tunnels; no real processes or ports."""
+
+    @pytest.fixture(autouse=True)
+    def _free_ports(self, monkeypatch):
+        import kiro_crew.instances.ssh_tunnel_manager as stm
+
+        monkeypatch.setattr(stm, "_is_port_free", lambda port, host="127.0.0.1": True)
+
+    def _mgr(self, tmp_path, *, factory=_FakeTunnel):
+        from kiro_crew.instances.registry import InstancesRegistry
+        from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+
+        async def ok_mint(
+            host, *, remote_bin="", ttl="20h", remote_port=None, embed_parent_port=None, timeout_secs=None
+        ):
+            return "SECRET_TOK"
+
+        return reg, SshTunnelManager(
+            reg, base_port=54200, mint_token=ok_mint, tunnel_factory=factory
+        )
+
+    def test_registry_field_default_roundtrip_and_validation(self, tmp_path):
+        from kiro_crew.instances.registry import Instance, InvalidInstanceError
+
+        # Older registry files have no key -> sentinel default.
+        assert Instance.from_dict({"id": "a", "name": "A"}).forwarder_pid == 0
+        inst = Instance(id="a", name="A", ssh_host="host-a", forwarder_pid=4321)
+        d = inst.to_dict()
+        assert d["forwarder_pid"] == 4321
+        assert Instance.from_dict(d).forwarder_pid == 4321
+        # A pid can never be negative; the sentinel 0 is the floor.
+        bad = Instance(id="a", name="A", ssh_host="host-a", forwarder_pid=-1)
+        with pytest.raises(InvalidInstanceError):
+            bad.validate()
+
+    @pytest.mark.asyncio
+    async def test_connect_persists_forwarder_pid(self, tmp_path):
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        def factory(*a, **k):
+            t = _FakeTunnel(*a, **k)
+            t.pid = 54321  # what _SshTunnel.pid reports for the live child
+            return t
+
+        reg, mgr = self._mgr(tmp_path, factory=factory)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        assert (await mgr.connect("cd-1")).state == TunnelState.CONNECTED
+        inst = reg.get("cd-1")
+        assert inst.forwarder_pid == 54321
+        assert inst.local_port > 0
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_forwarder_pid_with_local_port(self, tmp_path):
+        def factory(*a, **k):
+            t = _FakeTunnel(*a, **k)
+            t.pid = 54321
+            return t
+
+        reg, mgr = self._mgr(tmp_path, factory=factory)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+        assert reg.get("cd-1").forwarder_pid == 54321
+        await mgr.disconnect("cd-1")
+        inst = reg.get("cd-1")
+        # One atomic reset: a freed port is not reserved forever, and a stale
+        # pid never even reaches a later reclaim's identity check.
+        assert inst.local_port == 0
+        assert inst.forwarder_pid == 0
+
+    @pytest.mark.asyncio
+    async def test_mark_recovered_refreshes_forwarder_pid(self, tmp_path):
+        """A rebuild replaces the child; the recorded pid must move with it,
+        or the replacement leaks unrecorded at the next hard-kill."""
+
+        def factory(*a, **k):
+            t = _FakeTunnel(*a, **k)
+            t.pid = 54321
+            return t
+
+        reg, mgr = self._mgr(tmp_path, factory=factory)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+        assert reg.get("cd-1").forwarder_pid == 54321
+        mgr._tunnels["cd-1"].pid = 65432  # the rebuilt child's pid
+        await mgr._mark_recovered("cd-1")
+        assert reg.get("cd-1").forwarder_pid == 65432
+        assert reg.get("cd-1").was_connected is True
+
+
+class TestOrphanForwarderReclaim:
+    """End-to-end reclaim behavior against REAL processes holding REAL ports.
+
+    The reclaim path (``_reclaim_orphan_forwarder``) is keyed on the recorded
+    pid behind a strict exact-argv identity check. These tests spawn a real
+    child bound to a real loopback port and drive a real ``connect()``:
+
+    * the leaked-forwarder case proves the child is terminated and its port
+      released (identity confirmed via the real /proc//ps argv read);
+    * the #1972 regression cases prove a process this manager did not spawn is
+      NEVER signalled — whether its pid is recorded (pid recycled), unrecorded,
+      or its port is not even occupied.
+
+    ``_is_port_free`` stays REAL here (unlike the fake-port manager tests):
+    occupancy of the holder's port is the trigger under test.
+    """
+
+    def _mgr(self, tmp_path, *, base_port):
+        from kiro_crew.instances.registry import InstancesRegistry
+        from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+
+        async def ok_mint(
+            host, *, remote_bin="", ttl="20h", remote_port=None, embed_parent_port=None, timeout_secs=None
+        ):
+            return "SECRET_TOK"
+
+        return reg, SshTunnelManager(
+            reg, base_port=base_port, mint_token=ok_mint, tunnel_factory=_FakeTunnel
+        )
+
+    def _spawn_port_holder(self):
+        """Spawn a real child LISTENing on a free loopback port.
+
+        Returns ``(proc, port, argv)``. Readiness is signalled over stdout so
+        the bind (and /proc argv population) cannot be raced. A daemon reaper
+        thread ``wait()``s the child so that, once signalled, it disappears
+        immediately instead of lingering as a zombie — mirroring production,
+        where the leaked forwarder's parent is dead and init reaps it.
+        """
+        code = (
+            "import socket, sys, time\n"
+            "s = socket.socket()\n"
+            "s.bind(('127.0.0.1', 0))\n"
+            "s.listen(1)\n"
+            "sys.stdout.write('%d\\n' % s.getsockname()[1])\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(120)\n"
+        )
+        argv = [sys.executable, "-c", code]
+        proc = subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            line = proc.stdout.readline()
+            port = int(line.strip())
+        except Exception:
+            proc.kill()
+            raise
+        threading.Thread(target=proc.wait, daemon=True).start()
+        return proc, port, argv
+
+    @staticmethod
+    def _cleanup(proc):
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="the exact-argv identity guard fails closed on Windows (only the "
+        "image name is readable), so no reclaim happens there by design",
+    )
+    @pytest.mark.asyncio
+    async def test_hard_kill_leaked_forwarder_is_reclaimed_by_pid(self, tmp_path, monkeypatch):
+        """hard-kill -> restart -> reconnect: the recorded child is terminated
+        and its port released; connect proceeds on a fresh port."""
+        import kiro_crew.instances.ssh_tunnel_manager as stm
+        from kiro_crew.instances.port_allocator import _is_port_free
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        proc, port, argv = self._spawn_port_holder()
+        try:
+            # The identity check compares the recorded pid's REAL argv against
+            # the command line the manager would construct. The manager builds
+            # ssh argv; the leaked stand-in is a python child — point the
+            # builder at the stand-in's exact argv so the real /proc//ps read
+            # and the element-wise comparison are exercised end to end.
+            monkeypatch.setattr(
+                stm,
+                "_build_ssh_tunnel_argv",
+                lambda host, lp, rp, compression=True: list(argv),
+            )
+            reg, mgr = self._mgr(tmp_path, base_port=54300)
+            reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+            # What the pre-kill gateway persisted: its port and its child's pid.
+            reg.update("cd-1", local_port=port, forwarder_pid=proc.pid, was_connected=True)
+
+            st = await mgr.connect("cd-1")
+
+            assert st.state == TunnelState.CONNECTED
+            # (a) the old forwarder process is no longer alive…
+            assert proc.wait(timeout=10) is not None
+            # …and its port is released.
+            deadline = time.monotonic() + 5.0
+            while not _is_port_free(port) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert _is_port_free(port), "reclaimed forwarder's port was not released"
+            # The connect allocated around the (still-reserved) recorded port.
+            inst = reg.get("cd-1")
+            assert inst.local_port != port
+        finally:
+            self._cleanup(proc)
+
+    @pytest.mark.asyncio
+    async def test_recorded_pid_with_foreign_argv_is_never_signalled(self, tmp_path):
+        """#1972 regression: the recorded pid was recycled onto a process this
+        manager did not spawn (its argv is not the forward command line). It
+        must be left alone — on every platform."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        proc, port, _argv = self._spawn_port_holder()
+        try:
+            reg, mgr = self._mgr(tmp_path, base_port=54400)
+            reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+            reg.update("cd-1", local_port=port, forwarder_pid=proc.pid, was_connected=True)
+
+            st = await mgr.connect("cd-1")  # real argv builder: expects ssh …
+
+            assert st.state == TunnelState.CONNECTED
+            assert proc.poll() is None, "a foreign process holding the port was signalled"
+            inst = reg.get("cd-1")
+            assert inst.local_port != port  # allocated around the occupied port
+        finally:
+            self._cleanup(proc)
+
+    @pytest.mark.asyncio
+    async def test_unrecorded_port_holder_is_never_signalled(self, tmp_path):
+        """No recorded pid -> no candidate: the reclaim never scans the process
+        table for whoever holds the port (that scan is what #1972 removed)."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        proc, port, _argv = self._spawn_port_holder()
+        try:
+            reg, mgr = self._mgr(tmp_path, base_port=54500)
+            reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+            reg.update("cd-1", local_port=port, was_connected=True)  # pid stays 0
+
+            st = await mgr.connect("cd-1")
+
+            assert st.state == TunnelState.CONNECTED
+            assert proc.poll() is None, "an unrecorded port holder was signalled"
+        finally:
+            self._cleanup(proc)
+
+    @pytest.mark.asyncio
+    async def test_free_port_short_circuits_before_the_identity_check(
+        self, tmp_path, monkeypatch
+    ):
+        """A free recorded port means nothing leaked: the recorded pid is not
+        signalled even when its argv WOULD match (e.g. the pid was recycled
+        onto an innocent process while nothing holds the port)."""
+        import kiro_crew.instances.ssh_tunnel_manager as stm
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        code = "import sys, time; sys.stdout.write('R'); sys.stdout.flush(); time.sleep(120)"
+        argv = [sys.executable, "-c", code]
+        proc = subprocess.Popen(
+            argv, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        try:
+            assert proc.stdout.read(1) == b"R"
+            # Even a would-be-exact argv must not matter: the port probe gates.
+            monkeypatch.setattr(
+                stm,
+                "_build_ssh_tunnel_argv",
+                lambda host, lp, rp, compression=True: list(argv),
+            )
+            # A port nothing listens on: bind(0) to reserve one, then close it.
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+            s.close()
+
+            reg, mgr = self._mgr(tmp_path, base_port=54600)
+            reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+            reg.update("cd-1", local_port=free_port, forwarder_pid=proc.pid, was_connected=True)
+
+            st = await mgr.connect("cd-1")
+
+            assert st.state == TunnelState.CONNECTED
+            assert proc.poll() is None, "reclaim signalled a pid while its port was free"
+        finally:
+            self._cleanup(proc)

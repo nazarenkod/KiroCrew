@@ -285,7 +285,7 @@ to gain).
 
 ```
 id, name, ssh_host, remote_port (default 5476), local_port (0 = unallocated),
-ttl (default "20h"), remote_bin, was_connected
+ttl (default "20h"), remote_bin, was_connected, forwarder_pid (0 = none)
 ```
 
 plus a top-level `last_active_id`. `id` is a slug (`^[a-z0-9][a-z0-9-]{0,62}$`)
@@ -309,8 +309,28 @@ Two persisted hints drive lazy reconnect:
   not just one, and the active pane is frontend state. `get_last_active()` is the
   only reader and has no production caller.
 
+A third hint, `forwarder_pid`, exists for crash recovery rather than reconnect
+intent: `connect()` records the spawned forwarder child's pid next to
+`local_port` (one write), and a successful self-heal rebuild moves it to the
+replacement child. A gateway hard-kill (SIGKILL/crash) never runs teardown, so
+the forwarder survives, reparented to init, still holding its port and its
+session to the remote. The next `connect()` reclaims exactly that child: iff
+the recorded `local_port` probes occupied AND a pid is recorded AND that pid's
+**full argv exactly equals** the forward command line the manager would
+construct for the recorded port (`platform_compat.process_argv_matches_exact`),
+it is signalled (pid-scoped for ssh, whose child shares the dead gateway's
+process group; group-scoped for SSM, whose child owns its group) and the port
+comes back. Anything short of an exact match — pid gone, argv unreadable
+(always the case on Windows, so the guard fails closed there), or any element
+differing — means the pid was recycled onto a process the manager did not
+spawn: it is left alone and allocation simply skips its port. Reclamation is
+keyed on the manager's OWN recorded pid, never a process-table scan — matching
+the table by argv pattern is what once SIGTERMed forwards operators had opened
+themselves (#1972).
+
 `disconnect()` resets `local_port` to the unallocated sentinel together with
-`was_connected` in one write, so a freed port is never left reserved.
+`was_connected` and `forwarder_pid` in one write, so a freed port is never left
+reserved and a stale pid never reaches a later reclaim's identity check.
 
 ---
 

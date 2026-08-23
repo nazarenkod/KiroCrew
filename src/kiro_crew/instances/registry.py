@@ -106,6 +106,12 @@ _DEFAULT_CONNECTION_METHOD = "ssh"
 # allocator (Stage 3) assigns a real port at connect time.
 _UNALLOCATED_PORT = 0
 
+# ``forwarder_pid == 0`` is the sentinel for "no forwarder child recorded".
+# Connect records the spawned tunnel child's pid so a forwarder orphaned by a
+# gateway hard-kill can later be reclaimed by identity (its own pid) instead of
+# a process-table match; disconnect resets it together with ``local_port``.
+_NO_FORWARDER_PID = 0
+
 
 class InstancesError(Exception):
     """Base error for registry operations."""
@@ -187,6 +193,12 @@ class Instance:
     # (showing an error / click-to-reconnect state) instead of dropping it.
     # Startup uses it to decide which instances to auto-reconnect.
     was_connected: bool = False
+    # Pid of the tunnel forwarder child this manager spawned for the recorded
+    # ``local_port`` (0 = none recorded). Persisted so a forwarder orphaned by a
+    # gateway hard-kill can be reclaimed by its OWN pid behind a strict
+    # exact-argv identity check — never by matching the process table, which
+    # cannot distinguish our child from an operator's own forward (#1972).
+    forwarder_pid: int = _NO_FORWARDER_PID
 
     def validate(self) -> None:
         """Raise :class:`InvalidInstanceError` if any field is malformed."""
@@ -235,6 +247,11 @@ class Instance:
                     f"invalid {label} {port!r}: must be an int in "
                     f"[{lo}, 65535]" + (" (0 = unallocated)" if allow_zero else "")
                 )
+        if not isinstance(self.forwarder_pid, int) or self.forwarder_pid < 0:
+            raise InvalidInstanceError(
+                f"invalid forwarder_pid {self.forwarder_pid!r}: must be an int "
+                f">= 0 (0 = no forwarder recorded)"
+            )
 
     def to_dict(self) -> dict:
         """Serialize to the JSON shape stored in ``instances.json``."""
@@ -252,6 +269,7 @@ class Instance:
             "aws_region": self.aws_region,
             "ssm_run_as": self.ssm_run_as,
             "was_connected": self.was_connected,
+            "forwarder_pid": self.forwarder_pid,
         }
 
     @classmethod
@@ -285,6 +303,7 @@ class Instance:
             # empty string would fail validation — both mean "use the default".
             ssm_run_as=str(data.get("ssm_run_as", "") or _DEFAULT_SSM_RUN_AS),
             was_connected=bool(data.get("was_connected", False)),
+            forwarder_pid=_as_int(data.get("forwarder_pid"), _NO_FORWARDER_PID),
         )
 
 
@@ -462,7 +481,8 @@ class InstancesRegistry:
         Accepts any of: ``name``, ``ssh_host``, ``remote_port``, ``local_port``,
         ``ttl``, ``remote_bin``, ``connection_method``, ``ssm_target``,
         ``ssm_run_as``,
-        ``aws_profile``, ``aws_region``, ``was_connected``. The ``id`` is
+        ``aws_profile``, ``aws_region``, ``was_connected``, ``forwarder_pid``.
+        The ``id`` is
         immutable. ``mark_last_active=True`` additionally records the instance
         as the auto-revive target in the SAME read-modify-write, so callers that
         need both (a connect persisting its hints) get one atomic file rewrite
@@ -482,6 +502,7 @@ class InstancesRegistry:
             "aws_profile",
             "aws_region",
             "was_connected",
+            "forwarder_pid",
         }
         unknown = set(changes) - allowed
         if unknown:

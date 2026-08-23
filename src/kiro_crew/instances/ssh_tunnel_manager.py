@@ -93,7 +93,12 @@ from kiro_crew.instances.constants import (
 from kiro_crew.instances.constants import SEARCH_REPLY_MAX_BYTES as _SEARCH_REPLY_MAX_BYTES
 from kiro_crew.instances.diagnostics import diagnose_instance, diagnose_instance_ssm
 from kiro_crew.instances.port_allocator import PortAllocator, _is_port_free
-from kiro_crew.instances.registry import _UNALLOCATED_PORT, Instance, InstancesRegistry
+from kiro_crew.instances.registry import (
+    _NO_FORWARDER_PID,
+    _UNALLOCATED_PORT,
+    Instance,
+    InstancesRegistry,
+)
 from kiro_crew.instances.ssm_token_mint import (
     mint_remote_token_ssm,
     run_remote_kirocrew_ssm,
@@ -131,6 +136,18 @@ _MAX_STDERR_CHARS = 2000
 # can't spin a tight respawn loop. Applied in the scheduling seam (_on_tunnel_exit)
 # so direct _recover() callers (tests) aren't slowed.
 _RECOVER_BACKOFF_BASE_SECS = 1.0
+
+# Grace given to a reclaimed (hard-kill-orphaned) forwarder after SIGTERM
+# before escalating to SIGKILL, and after SIGKILL before giving up waiting.
+# `ssh -N` exits on TERM essentially immediately; the escalation mirrors
+# _SshTunnel._terminate's shape with tighter bounds because this runs inside
+# connect() under the manager lock. Nothing in the connect depends on the wait
+# completing — the recorded port stays excluded from allocation either way —
+# so a slow exit costs only these bounded seconds, never correctness.
+_RECLAIM_TERM_GRACE_SECS = 2.0
+_RECLAIM_KILL_GRACE_SECS = 1.0
+# Liveness poll cadence while waiting out the grace windows above.
+_RECLAIM_POLL_INTERVAL_SECS = 0.05
 
 # ssh prints these benign advisory lines to stderr on connect (post-quantum KEX
 # warning); they are NOT failures. Strip them from captured stderr so the real
@@ -723,6 +740,45 @@ class _SshTunnel:
         return proc.pid if proc is not None and proc.returncode is None else None
 
 
+def _terminate_reclaimed_forwarder(pid: int, tree: bool) -> bool:
+    """SIGTERM (escalating to SIGKILL) an identity-verified leaked forwarder.
+
+    Blocking by design — signals plus liveness polls — so callers run it in a
+    worker thread, never on the event loop. Returns whether the process is gone
+    by the end of the grace windows; the caller treats False as "log and move
+    on" because allocation excludes the recorded port regardless.
+
+    ``tree=True`` for the SSM transport, whose child was spawned into its own
+    process group (``start_new_session``) so the group signal reaps the
+    ``session-manager-plugin`` grandchild still holding the forwarded port.
+    The ssh child is spawned WITHOUT a new group: after a gateway hard-kill it
+    sits in the DEAD gateway's process group, where a group signal could hit
+    unrelated survivors of that group — so it gets a pid-scoped signal only,
+    which suffices because ``ssh -N`` holds the forward itself and spawns no
+    descendants of its own.
+    """
+
+    def _deliver(sig: int) -> None:
+        if tree and _SshTunnel._signal_group(pid, sig):
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError, ValueError):
+            platform_compat.kill_pid(pid, sig)
+
+    def _wait_gone(grace_secs: float) -> bool:
+        deadline = time.monotonic() + grace_secs
+        while time.monotonic() < deadline:
+            if not platform_compat.pid_exists(pid):
+                return True
+            time.sleep(_RECLAIM_POLL_INTERVAL_SECS)
+        return not platform_compat.pid_exists(pid)
+
+    _deliver(platform_compat.SIGTERM)
+    if _wait_gone(_RECLAIM_TERM_GRACE_SECS):
+        return True
+    _deliver(platform_compat.SIGKILL)
+    return _wait_gone(_RECLAIM_KILL_GRACE_SECS)
+
+
 @dataclass
 class _TransportParams:
     """Validated, transport-specific connection parameters for one instance.
@@ -890,6 +946,77 @@ class SshTunnelManager:
                 reserved.add(inst.local_port)
         return reserved
 
+    async def _reclaim_orphan_forwarder(self, inst: Instance, params: _TransportParams) -> None:
+        """Reclaim *inst*'s own forwarder child leaked by a gateway hard-kill.
+
+        A SIGKILLed gateway never runs teardown, so its forwarder child
+        survives, reparented to init with nothing left to reap it: one idle
+        process, one loopback port, and one live session to the remote per
+        hard-kill → reconnect cycle. The restarted manager finds the recorded
+        ``local_port`` occupied and (correctly) allocates around it; this hook
+        is what turns that permanent leak into a reclaim.
+
+        Reclamation is keyed on OUR OWN recorded pid, never a process-table
+        match — matching the table by argv pattern is what once SIGTERMed
+        forwards operators had opened themselves (#1972), and no pattern can
+        distinguish our child from a stranger's. The recorded pid is trusted
+        only behind a STRICT identity check: its full argv must EXACTLY equal
+        the forward command line this manager would construct for the recorded
+        port (host and all). Anything less — process gone, argv unreadable, or
+        any element differing — means the pid was recycled onto a process this
+        manager did not spawn: it is left alone and connect falls through to
+        normal allocation. Best-effort: a failed reclaim never fails the
+        connect, it only leaves the leak for the next attempt.
+
+        Runs under the manager lock (its caller ``connect`` holds it); every
+        blocking step — the port probe, the argv read, the signal-and-wait —
+        is pushed off the event loop via ``asyncio.to_thread``.
+        """
+        pid = inst.forwarder_pid
+        port = inst.local_port
+        if pid <= 1 or port <= 0:
+            return  # nothing recorded (or a reserved pid we refuse to touch)
+        if await asyncio.to_thread(_is_port_free, port):
+            return  # nothing holds the recorded port — nothing leaked to reclaim
+        if params.method == "ssm":
+            expected = _build_ssm_tunnel_argv(
+                params.ssm_target,
+                port,
+                inst.remote_port,
+                profile=params.aws_profile,
+                region=params.aws_region,
+            )
+        else:
+            expected = _build_ssh_tunnel_argv(
+                params.ssh_host, port, inst.remote_port, compression=self._ssh_compression
+            )
+        matched = await asyncio.to_thread(
+            platform_compat.process_argv_matches_exact, pid, expected
+        )
+        if not matched:
+            return  # not (or no longer) our child — never signal it (#1972)
+        gone = await asyncio.to_thread(
+            _terminate_reclaimed_forwarder, pid, params.method == "ssm"
+        )
+        if gone:
+            logger.info(
+                "Reclaimed leaked %s forwarder pid %d for %s (released port %d)",
+                params.method,
+                pid,
+                inst.id,
+                port,
+            )
+        else:
+            logger.warning(
+                "Leaked %s forwarder pid %d for %s did not exit within the "
+                "reclaim grace; leaving it for the next connect (port %d stays "
+                "excluded from allocation)",
+                params.method,
+                pid,
+                inst.id,
+                port,
+            )
+
     def _connect_timeout_for(self, method: str) -> float:
         """Readiness timeout for *method*, honoring an explicit caller override.
 
@@ -1012,6 +1139,13 @@ class SshTunnelManager:
                 if not cloud_ssm.session_manager_plugin_installed():
                     return self._error_status(inst, cloud_ssm.session_manager_plugin_install_hint())
 
+            # Reclaim our own forwarder if a prior gateway hard-kill leaked it
+            # still holding this instance's recorded port. Keyed on the recorded
+            # pid behind a strict exact-argv identity check — see the method for
+            # why nothing else is ever signalled. Best-effort: allocation below
+            # skips the recorded port whether or not the reclaim succeeded.
+            await self._reclaim_orphan_forwarder(inst, params)
+
             # Allocate a free loopback port for the forward. It deliberately does
             # NOT have to equal ``inst.remote_port``. The embedded dashboard runs
             # in an iframe at http://127.0.0.1:<local_port>, and the remote
@@ -1043,15 +1177,16 @@ class SshTunnelManager:
             # That skip is why no orphan-reaping step is needed for connect to
             # make PROGRESS: nothing has to be killed to get a working tunnel.
             #
-            # The cost that buys, stated rather than implied: an ``ssh -N -L``
-            # child orphaned by a gateway hard-kill is no longer signalled, so it
-            # keeps its loopback port and its session to the remote until the OS
-            # reaps it. That is accepted here deliberately. The reaper this
-            # replaced matched the process table by argv and could SIGTERM a
-            # forward the operator had opened themselves (#1972), and no argv
-            # pattern distinguishes our child from a stranger's. Reclaiming it
-            # safely means tracking our own pid, which is #5235, not a rider on
-            # this change.
+            # The cost that skip alone would carry: an ``ssh -N -L`` child
+            # orphaned by a gateway hard-kill keeps its loopback port and its
+            # session to the remote until the OS reaps it. That leak is now
+            # reclaimed by ``_reclaim_orphan_forwarder`` above — by the child's
+            # RECORDED pid behind a strict exact-argv identity check, never by
+            # scanning the process table. The reaper that scan-based approach
+            # replaced matched argv patterns and could SIGTERM a forward the
+            # operator had opened themselves (#1972); an unrecorded or
+            # unverified process is therefore left alone, and allocation simply
+            # skips its port.
             #
             # There is deliberately no "take my own previous port back" branch.
             # It reads as free stability, but the case it fires in cannot benefit:
@@ -1125,10 +1260,13 @@ class SshTunnelManager:
             self._store_token(instance_id, token, inst.ttl)
             self._schedule_token_refresh(instance_id)
 
-            # Persist hints: port assignment, was_connected, last-active — ONE
-            # read-modify-rewrite of instances.json (fsync), so the pair is
+            # Persist hints: port assignment, forwarder pid, was_connected,
+            # last-active — ONE
+            # read-modify-rewrite of instances.json (fsync), so the set is
             # durable together and the manager lock is held for a single fsync
-            # round-trip. _persist_hint runs it off the loop and does not
+            # round-trip. The pid is the identity key a later connect uses to
+            # reclaim this child if a gateway hard-kill orphans it.
+            # _persist_hint runs it off the loop and does not
             # return — even under cancellation — until the write completes, so
             # the lock cannot release while the worker write is still in
             # flight (a late hint write would race a subsequent disconnect).
@@ -1137,6 +1275,7 @@ class SshTunnelManager:
                 instance_id,
                 mark_last_active=True,
                 local_port=local_port,
+                forwarder_pid=tunnel.pid or _NO_FORWARDER_PID,
                 was_connected=True,
             )
             # A successful (re)connect clears any stale give-up counter so the next
@@ -1199,14 +1338,21 @@ class SshTunnelManager:
         await self._cancel_token_refresh_and_wait(instance_id)
         # Clear the lazy-reconnect hint AND the recorded local port together
         # (one atomic write). local_port must return to the unallocated
-        # sentinel so the now-free port is not treated as reserved forever.
-        # _persist_hint runs the read-modify-rewrite off the loop and does
+        # sentinel so the now-free port is not treated as reserved forever,
+        # and the forwarder pid goes with it: the child was just stopped, so a
+        # retained pid would eventually be recycled by the OS and point a later
+        # reclaim at a stranger (the exact-argv guard would refuse it, but a
+        # cleared hint never even asks). _persist_hint runs the
+        # read-modify-rewrite off the loop and does
         # not return — even if this handler is cancelled (e.g. aiohttp
         # aborting at shutdown) — until the write completes: the in-memory
         # teardown above is already done, so abandoning the persisted reset
         # would leave was_connected=True plus a stale local_port, reviving
         # an instance the user disconnected and pinning the freed port.
-        hints: dict[str, object] = {"local_port": _UNALLOCATED_PORT}
+        hints: dict[str, object] = {
+            "local_port": _UNALLOCATED_PORT,
+            "forwarder_pid": _NO_FORWARDER_PID,
+        }
         if not keep_intent:
             hints["was_connected"] = False
         await self._persist_hint(self._registry.update, instance_id, **hints)
@@ -1413,7 +1559,13 @@ class SshTunnelManager:
         return await tunnel.start()
 
     async def _mark_recovered(self, instance_id: str) -> None:
-        """Reset the attempt counter and persist the hint, under lock, iff tracked.
+        """Reset the attempt counter and persist the hints, under lock, iff tracked.
+
+        A rebuild replaced the tunnel child, so the recorded ``forwarder_pid``
+        must move with ``was_connected`` — a stale pid would point a later
+        hard-kill reclaim at a process that no longer exists (harmless, the
+        identity check refuses it) while the ACTUAL replacement child leaked
+        unrecorded. Both hints go in one write.
 
         The persist stays INSIDE the manager lock so write order equals
         lock-acquisition order: a concurrent :meth:`disconnect`'s
@@ -1426,10 +1578,16 @@ class SshTunnelManager:
         its write could land after the lock released and break the ordering.
         """
         async with self._lock:
-            if instance_id not in self._tunnels:
+            tunnel = self._tunnels.get(instance_id)
+            if tunnel is None:
                 return
             self._recover_attempts[instance_id] = 0
-            await self._persist_hint(self._registry.set_was_connected, instance_id, True)
+            await self._persist_hint(
+                self._registry.update,
+                instance_id,
+                was_connected=True,
+                forwarder_pid=tunnel.pid or _NO_FORWARDER_PID,
+            )
 
     async def _recover(self, instance_id: str) -> None:
         """2-tier self-heal for an unhealthy tunnel (either transport).
