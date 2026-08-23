@@ -34,6 +34,7 @@ import {
 import { registerTheme, getRegisteredThemes } from '../hooks/useTheme'
 import { registerCapsuleSegment, getCapsuleSegments } from '../apps/capsuleSegments'
 import { registerOverviewStatCards, getOverviewStatCards } from '../pages/overviewStatCards'
+import { registerOverviewPanel, getOverviewPanel } from '../pages/overviewPanel'
 import { apiTransport } from '../api/apiTransport'
 // Importing the client installs the blessed transport (installApiTransport runs
 // at client module load), so `apiTransport` is populated for the test below.
@@ -311,6 +312,27 @@ describe('overviewStatCards — settings status-card seam', () => {
       registerOverviewStatCards([{ id: 'testcard:dup', component: () => null }]),
     ).toThrow(/already registered/)
     expect(getOverviewStatCards().filter(c => c.id === 'testcard:dup').length).toBe(1)
+  })
+})
+
+describe('overviewPanel — lower-region single-owner slot', () => {
+  it('is empty in the stock build until something claims it', () => {
+    expect(getOverviewPanel()).toBeNull()
+  })
+
+  it('registers a panel and returns it', () => {
+    const Comp = () => null
+    registerOverviewPanel({ id: 'testpanel:a', component: Comp })
+    expect(getOverviewPanel()).toEqual({ id: 'testpanel:a', component: Comp })
+  })
+
+  it('throws on a second claim in dev/test; the first owner keeps the slot', () => {
+    // The slot is deliberately singular: a second registrant is a collision,
+    // not an append, so the region never has two owners negotiating layout.
+    expect(() =>
+      registerOverviewPanel({ id: 'testpanel:b', component: () => null }),
+    ).toThrow(/already owns the overview panel slot/)
+    expect(getOverviewPanel()?.id).toBe('testpanel:a')
   })
 })
 
