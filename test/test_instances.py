@@ -4271,6 +4271,14 @@ class TestSsmRegistry:
 class TestSsmTunnelArgv:
     """The SSM port-forward argv (loopback-bound, no shell, no injected opts)."""
 
+    @pytest.fixture(autouse=True)
+    def _bare_resolver(self, monkeypatch):
+        """Pin the shared aws-CLI resolver (#4770) to the bare name so the
+        argv-shape assertions stay deterministic across hosts."""
+        from kiro_crew.cloud import ssm
+
+        monkeypatch.setattr(ssm, "resolve_aws_bin", lambda: "aws")
+
     def test_argv_shape(self):
         from kiro_crew.instances.ssh_tunnel_manager import _build_ssm_tunnel_argv
 
